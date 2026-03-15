@@ -81,6 +81,8 @@ mod symbols;
 mod types;
 mod variables;
 mod wasm;
+#[cfg(target_family = "wasm")]
+mod wasm_api;
 
 mod models;
 #[cfg(test)]

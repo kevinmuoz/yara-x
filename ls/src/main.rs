@@ -1,6 +1,8 @@
+#[cfg(not(target_family = "wasm"))]
 use yara_x_ls::serve;
 
 /// Starts the Language Server Main Loop using Standard Input Output.
+#[cfg(not(target_family = "wasm"))]
 pub async fn serve_stdio() -> Result<(), async_lsp::Error> {
     #[cfg(unix)]
     let (stdin, stdout) = (
@@ -19,6 +21,7 @@ pub async fn serve_stdio() -> Result<(), async_lsp::Error> {
     serve(stdin, stdout).await
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[tokio::main(flavor = "current_thread")]
 pub async fn main() -> Result<(), async_lsp::Error> {
     #[cfg(feature = "tracing")]
@@ -28,3 +31,6 @@ pub async fn main() -> Result<(), async_lsp::Error> {
         .init();
     serve_stdio().await
 }
+
+#[cfg(target_family = "wasm")]
+pub fn main() {}

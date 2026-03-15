@@ -48,9 +48,20 @@ walkdir = "2.5.0"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 async-lsp = {version = "0.2.2", default-features=false, features=["omni-trait"]}
+console_error_panic_hook = "0.1"
+futures-channel = "0.3"
+js-sys = "0.3"
+wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { version = "0.4.61"}
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "DedicatedWorkerGlobalScope",
+    "MessageEvent",
+    "WebSocket",
+    "console",
+] }
+ws_stream_wasm = "0.7"
 
 
 [dev-dependencies]
 goldenfile = { workspace = true }
-

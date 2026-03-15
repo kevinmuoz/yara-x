@@ -27,6 +27,9 @@ all-features = true
 # Pass "docsrs" config to rustdoc while generating documentation for doc.rs
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [features]
 # Enables constant folding. When constant folding is enabled, expressions
 # like `2+2+2` and `true or false`, whose value can be determined at compile
