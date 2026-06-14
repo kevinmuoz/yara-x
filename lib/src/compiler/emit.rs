@@ -27,7 +27,7 @@ use crate::compiler::ir::{
 };
 use crate::compiler::{
     FieldAccess, ForVars, LiteralId, OfExprTuple, OfPatternSet, PatternId,
-    RegexpId, RuleId, RuleInfo, Var,
+    RegexId, RuleId, RuleInfo, Var,
 };
 use crate::scanner::RuntimeObjectHandle;
 use crate::string_pool::{BStringPool, StringPool};
@@ -205,7 +205,7 @@ pub(crate) struct EmitContext<'a> {
     pub wasm_exports: &'a FxHashMap<String, FunctionId>,
 
     /// Pool with regular expressions used in rule conditions.
-    pub regexp_pool: &'a mut StringPool<RegexpId>,
+    pub regex_pool: &'a mut StringPool<RegexId>,
 
     /// Pool with literal strings used in the rules.
     pub lit_pool: &'a mut BStringPool<LiteralId>,
@@ -313,7 +313,7 @@ fn emit_expr(
                     .i64_const(RuntimeString::Literal(literal_id).into_wasm());
             }
             TypeValue::Regexp(Some(regexp)) => {
-                let re_id = ctx.regexp_pool.get_or_intern(regexp.as_str());
+                let re_id = ctx.regex_pool.get_or_intern(regexp.as_str());
 
                 instr.i32_const(re_id.into());
             }
@@ -638,6 +638,14 @@ fn emit_expr(
             emit_operands!(ctx, ir, *lhs, *rhs, instr);
             instr
                 .call(ctx.function_id(wasm::export__str_matches.mangled_name));
+        }
+
+        Expr::MatchesMany { lhs, regex_set } => {
+            emit_expr(ctx, ir, *lhs, instr);
+            instr.i32_const((*regex_set).into());
+            instr.call(ctx.function_id(
+                wasm::export__str_matches_regex_set.mangled_name,
+            ));
         }
 
         Expr::Lookup(lookup) => {
@@ -1554,7 +1562,6 @@ fn emit_of_pattern_set_with_loop(
 
     let num_patterns = of.items.len();
     let mut patterns = of.items.iter();
-    let next_pattern_id = of.next_pattern_var;
 
     emit_for(
         ctx,
@@ -1569,8 +1576,8 @@ fn emit_of_pattern_set_with_loop(
         },
         // Before each iteration.
         |ctx, instr, i| {
-            // Get the i-th pattern ID, and store it in `next_pattern_id`.
-            set_var(ctx, instr, next_pattern_id, |ctx, instr| {
+            // Get the i-th pattern ID, and store it in `of.for_vars.item`.
+            set_var(ctx, instr, of.for_vars.item, |ctx, instr| {
                 load_var(ctx, instr, i);
                 emit_switch(ctx, I64, instr, |ctx, instr| {
                     if let Some(pattern) = patterns.next() {
@@ -1584,7 +1591,7 @@ fn emit_of_pattern_set_with_loop(
         // Body
         |ctx, instr| {
             // Push the pattern ID into the stack.
-            load_var(ctx, instr, next_pattern_id);
+            load_var(ctx, instr, of.for_vars.item);
             // load_var returns an I64, convert it to I32.
             instr.unop(UnaryOp::I32WrapI64);
 
@@ -1621,7 +1628,6 @@ fn emit_of_expr_tuple(
 ) {
     let num_expressions = of.items.len();
     let mut expressions = of.items.iter();
-    let next_item = of.next_expr_var;
 
     emit_for(
         ctx,
@@ -1636,12 +1642,12 @@ fn emit_of_expr_tuple(
         },
         // Before each iteration.
         |ctx, instr, i| {
-            // Execute the i-th expression and save its result in `next_item`.
-            set_var(ctx, instr, next_item, |ctx, instr| {
+            // Execute the i-th expression and save its result in `of.for_vars.item`.
+            set_var(ctx, instr, of.for_vars.item, |ctx, instr| {
                 load_var(ctx, instr, i);
                 emit_switch(
                     ctx,
-                    next_item.ty().into(),
+                    of.for_vars.item.ty().into(),
                     instr,
                     |ctx, instr| {
                         if let Some(expr) = expressions.next() {
@@ -1655,7 +1661,7 @@ fn emit_of_expr_tuple(
         },
         // Body.
         |ctx, instr| {
-            load_var(ctx, instr, next_item);
+            load_var(ctx, instr, of.for_vars.item);
         },
         // After each iteration.
         |_, _, _| {},
@@ -1671,7 +1677,6 @@ fn emit_for_of_pattern_set(
 ) {
     let num_patterns = for_of.pattern_set.len();
     let mut patterns = for_of.pattern_set.iter();
-    let next_pattern_id = for_of.variable;
 
     emit_for(
         ctx,
@@ -1686,8 +1691,8 @@ fn emit_for_of_pattern_set(
         },
         // Before each iteration.
         |ctx, instr, i| {
-            // Get the i-th pattern ID, and store it in `next_pattern_id`.
-            set_var(ctx, instr, next_pattern_id, |ctx, instr| {
+            // Get the i-th pattern ID, and store it in `for_of.for_vars.item`.
+            set_var(ctx, instr, for_of.for_vars.item, |ctx, instr| {
                 load_var(ctx, instr, i);
                 emit_switch(ctx, I64, instr, |ctx, instr| {
                     if let Some(pattern) = patterns.next() {
@@ -1822,13 +1827,9 @@ fn emit_for_in_array(
     // The only variable contains the loop's next item.
     let next_item = for_in.variables[0];
 
-    // The variable `array_var` will hold a reference to the array being
-    // iterated.
-    let array_var = for_in.iterable_var;
-
     // Emit the expression that returns the array and stores a reference to
-    // it in `array_var`.
-    set_var(ctx, instr, array_var, |ctx, instr| {
+    // it in `for_in.for_vars.item`.
+    set_var(ctx, instr, for_in.for_vars.item, |ctx, instr| {
         emit_expr(ctx, ir, expr, instr);
     });
 
@@ -1840,7 +1841,7 @@ fn emit_for_in_array(
         |ctx, instr, n, loop_end| {
             // Initialize `n` to the array's length.
             set_var(ctx, instr, n, |ctx, instr| {
-                load_var(ctx, instr, array_var);
+                load_var(ctx, instr, for_in.for_vars.item);
                 instr.call(
                     ctx.function_id(wasm::export__array_len.mangled_name),
                 );
@@ -1864,7 +1865,7 @@ fn emit_for_in_array(
             // Get the i-th item in the array and store it in the
             // local variable `next_item`.
             set_var(ctx, instr, next_item, |ctx, instr| {
-                load_var(ctx, instr, array_var);
+                load_var(ctx, instr, for_in.for_vars.item);
                 load_var(ctx, instr, i);
                 emit_array_indexing(ctx, instr, &array);
             });
@@ -1894,13 +1895,9 @@ fn emit_for_in_map(
     let next_key = for_in.variables[0];
     let next_val = for_in.variables[1];
 
-    // The variable `map_var` will hold a reference to the array being
-    // iterated.
-    let map_var = for_in.iterable_var;
-
     // Emit the expression that returns the map and stores a reference to
-    // it in `map_var`.
-    set_var(ctx, instr, map_var, |ctx, instr| {
+    // it in `for_in.for_vars.item`.
+    set_var(ctx, instr, for_in.for_vars.item, |ctx, instr| {
         emit_expr(ctx, ir, expr, instr);
     });
 
@@ -1912,7 +1909,7 @@ fn emit_for_in_map(
         |ctx, instr, n, loop_end| {
             // Initialize `n` to the map's length.
             set_var(ctx, instr, n, |ctx, instr| {
-                load_var(ctx, instr, map_var);
+                load_var(ctx, instr, for_in.for_vars.item);
                 instr
                     .call(ctx.function_id(wasm::export__map_len.mangled_name));
             });
@@ -1933,7 +1930,7 @@ fn emit_for_in_map(
         // Before each iteration.
         |ctx, instr, i| {
             set_vars(ctx, instr, &[next_key, next_val], |ctx, instr| {
-                load_var(ctx, instr, map_var);
+                load_var(ctx, instr, for_in.for_vars.item);
                 load_var(ctx, instr, i);
                 emit_map_lookup_by_index(ctx, instr, &map);
             });

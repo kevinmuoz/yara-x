@@ -29,7 +29,8 @@ allows using the same regex engine for matching both types of patterns.
 [Hir]: regex_syntax::hir::Hir
 */
 
-use std::collections::Bound;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, Bound};
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::mem;
@@ -51,7 +52,7 @@ use crate::compiler::ir::dfs::{
     DFSIter, DFSWithScopeIter, Event, EventContext, dfs_common,
 };
 
-use crate::compiler::FilesizeBounds;
+use crate::compiler::{FilesizeBounds, HeaderConstraint, RegexSetId};
 use crate::re;
 use crate::symbols::Symbol;
 use crate::types::Value::Const;
@@ -107,6 +108,7 @@ pub(crate) struct PatternInRule<'src> {
     pattern: Pattern,
     span: Span,
     in_use: bool,
+    fast_scan_allowed: bool,
 }
 
 impl<'src> PatternInRule<'src> {
@@ -183,6 +185,27 @@ impl<'src> PatternInRule<'src> {
         self.in_use = true;
         self
     }
+
+    /// Returns true if this pattern can be fast-scanned.
+    ///
+    /// A pattern can be fast-scanned if its occurrences are only evaluated
+    /// as simple boolean checks (e.g. `$a`), meaning the scanner can stop
+    /// tracking matches for it once the first match has been found.
+    #[inline]
+    pub fn fast_scan_allowed(&self) -> bool {
+        self.fast_scan_allowed
+    }
+
+    /// Disallows fast-scanning for this pattern.
+    ///
+    /// This is called when the pattern is used in a context that requires
+    /// tracking all matches (such as count `#a`, offset `@a`, length `!a`,
+    /// anchored checks, or loop equivalents).
+    #[inline]
+    pub fn disallow_fast_scan(&mut self) -> &mut Self {
+        self.fast_scan_allowed = false;
+        self
+    }
 }
 
 /// Represents a pattern in YARA.
@@ -253,10 +276,8 @@ impl Pattern {
                 *anchored_at = None;
                 self.flags_mut().insert(PatternFlags::NonAnchorable);
             }
-            None => {
-                if is_anchorable {
-                    *anchored_at = Some(offset);
-                }
+            None if is_anchorable => {
+                *anchored_at = Some(offset);
             }
             _ => {}
         }
@@ -290,6 +311,17 @@ impl Pattern {
             }
         }
     }
+
+    pub fn set_header_constraints(&mut self, constraints: &HeaderConstraint) {
+        match self {
+            Pattern::Text(literal) => {
+                literal.header_constraints = constraints.clone();
+            }
+            Pattern::Regexp(regexp) | Pattern::Hex(regexp) => {
+                regexp.header_constraints = constraints.clone();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -301,6 +333,7 @@ pub(crate) struct LiteralPattern {
     pub base64_alphabet: Option<String>,
     pub base64wide_alphabet: Option<String>,
     pub filesize_bounds: FilesizeBounds,
+    pub header_constraints: HeaderConstraint,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -309,6 +342,7 @@ pub(crate) struct RegexpPattern {
     pub hir: re::hir::Hir,
     pub anchored_at: Option<usize>,
     pub filesize_bounds: FilesizeBounds,
+    pub header_constraints: HeaderConstraint,
 }
 
 /// The index of a pattern in the rule that declares it.
@@ -795,8 +829,8 @@ impl IR {
                                     break;
                                 }
                             }
-                            // .. and take the loop that inside directly inside
-                            // the one that defined the variable
+                            // .. and take the loop that is directly inside
+                            // the one that defined the variable.
                             if let Some(inner_loop) = scopes.next() {
                                 result.push((current_expr_id, inner_loop));
                             }
@@ -847,7 +881,7 @@ impl IR {
                 .sum::<i32>();
 
             // Shift all variables with an index greater or equal than
-            // var_index one position to the left in order to make room for
+            // var_index one position to the right in order to make room for
             // the new variable used by the `with` statement that will be
             // inserted.
             self.shift_vars(loop_expr_id, var_index, 1);
@@ -971,6 +1005,251 @@ impl IR {
         }
 
         result
+    }
+
+    pub fn header_constraints(
+        &self,
+        pattern_prefix_lookup: impl Fn(PatternIdx) -> Option<Vec<u8>>,
+    ) -> HeaderConstraint {
+        let mut constrained_bytes = BTreeMap::new();
+        let mut unsatisfiable = false;
+        let mut dfs = self.dfs_iter(self.root.unwrap());
+
+        while let Some(evt) = dfs.next() {
+            let expr = match evt {
+                Event::Enter((_, expr, _)) => expr,
+                _ => continue,
+            };
+            match expr {
+                Expr::Eq { lhs, rhs } => {
+                    self.extract_header_constraints_from_eq(
+                        *lhs,
+                        *rhs,
+                        &mut constrained_bytes,
+                        &mut unsatisfiable,
+                    );
+                }
+                Expr::PatternMatch { pattern, anchor } => {
+                    if let MatchAnchor::At(offset_expr) = anchor
+                        && let Some(0) =
+                            self.get(*offset_expr).try_as_const_integer()
+                        && let Some(prefix_bytes) =
+                            pattern_prefix_lookup(*pattern)
+                    {
+                        for (i, &b) in prefix_bytes.iter().enumerate() {
+                            match constrained_bytes.entry(i) {
+                                Entry::Occupied(entry) => {
+                                    if *entry.get() != b {
+                                        unsatisfiable = true;
+                                        break;
+                                    }
+                                }
+                                Entry::Vacant(entry) => {
+                                    entry.insert(b);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if unsatisfiable {
+                break;
+            }
+            if !matches!(expr, Expr::And { .. }) {
+                dfs.prune();
+            }
+        }
+
+        if unsatisfiable {
+            return HeaderConstraint::Unsatisfiable;
+        }
+
+        // If the first byte in `constrained_bytes` is at offset 0, we can
+        // return HeaderConstraint::Constrained.
+        if let Some((0, _)) = constrained_bytes.first_key_value() {
+            HeaderConstraint::Constrained(
+                // Take only the bytes at consecutive offsets starting at 0.
+                constrained_bytes
+                    .into_iter()
+                    .enumerate()
+                    .map_while(
+                        |(i, (offset, byte))| {
+                            if i == offset { Some(byte) } else { None }
+                        },
+                    )
+                    .collect(),
+            )
+        } else {
+            HeaderConstraint::Unconstrained
+        }
+    }
+
+    fn extract_header_constraints_from_eq(
+        &self,
+        lhs: ExprId,
+        rhs: ExprId,
+        constrained_bytes: &mut BTreeMap<usize, u8>,
+        unsatisfiable: &mut bool,
+    ) {
+        if let Some(val) = self.get(rhs).try_as_const_integer()
+            && self.apply_int_read_constraint(
+                constrained_bytes,
+                unsatisfiable,
+                lhs,
+                val,
+            )
+        {
+            return;
+        }
+        if let Some(val) = self.get(lhs).try_as_const_integer() {
+            self.apply_int_read_constraint(
+                constrained_bytes,
+                unsatisfiable,
+                rhs,
+                val,
+            );
+        }
+    }
+
+    fn add_constraint(
+        &self,
+        constrained_bytes: &mut BTreeMap<usize, u8>,
+        unsatisfiable: &mut bool,
+        offset: usize,
+        value: u8,
+    ) {
+        if *unsatisfiable {
+            return;
+        }
+        match constrained_bytes.entry(offset) {
+            Entry::Occupied(entry) => {
+                if *entry.get() != value {
+                    *unsatisfiable = true;
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+            }
+        }
+    }
+
+    fn apply_int_read_constraint(
+        &self,
+        constrained_bytes: &mut BTreeMap<usize, u8>,
+        unsatisfiable: &mut bool,
+        expr_id: ExprId,
+        val: i64,
+    ) -> bool {
+        let func_call = match self.get(expr_id) {
+            Expr::FuncCall(func_call) => func_call,
+            _ => return false,
+        };
+
+        if let Some(offset) = func_call
+            .args
+            .first()
+            .and_then(|arg| self.get(*arg).try_as_const_integer())
+            && offset >= 0
+        {
+            match func_call.plain_name() {
+                "uint8" | "int8" | "uint8be" | "int8be" => {
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize,
+                        val as u8,
+                    );
+                    return true;
+                }
+                "uint16" | "int16" => {
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize,
+                        (val as u16 & 0xff) as u8,
+                    );
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize + 1,
+                        ((val as u16 >> 8) & 0xff) as u8,
+                    );
+                    return true;
+                }
+                "uint16be" | "int16be" => {
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize,
+                        ((val as u16 >> 8) & 0xff) as u8,
+                    );
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize + 1,
+                        (val as u16 & 0xff) as u8,
+                    );
+                    return true;
+                }
+                "uint32" | "int32" => {
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize,
+                        (val as u32 & 0xff) as u8,
+                    );
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize + 1,
+                        ((val as u32 >> 8) & 0xff) as u8,
+                    );
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize + 2,
+                        ((val as u32 >> 16) & 0xff) as u8,
+                    );
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize + 3,
+                        ((val as u32 >> 24) & 0xff) as u8,
+                    );
+                    return true;
+                }
+                "uint32be" | "int32be" => {
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize,
+                        ((val as u32 >> 24) & 0xff) as u8,
+                    );
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize + 1,
+                        ((val as u32 >> 16) & 0xff) as u8,
+                    );
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize + 2,
+                        ((val as u32 >> 8) & 0xff) as u8,
+                    );
+                    self.add_constraint(
+                        constrained_bytes,
+                        unsatisfiable,
+                        offset as usize + 3,
+                        (val as u32 & 0xff) as u8,
+                    );
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
     }
 }
 
@@ -1155,6 +1434,12 @@ impl IR {
 
     /// Creates a new [`Expr::BitwiseNot`].
     pub fn bitwise_not(&mut self, operand: ExprId) -> ExprId {
+        if self.constant_folding
+            && let Some(val) = self.get(operand).try_as_const_integer()
+        {
+            return self.constant(TypeValue::const_integer_from(!val));
+        }
+
         let expr_id = ExprId::from(self.nodes.len());
         self.parents[operand.0 as usize] = expr_id;
         self.parents.push(ExprId::none());
@@ -1165,6 +1450,16 @@ impl IR {
 
     /// Creates a new [`Expr::BitwiseAnd`].
     pub fn bitwise_and(&mut self, lhs: ExprId, rhs: ExprId) -> ExprId {
+        if self.constant_folding
+            && let (Some(lhs_val), Some(rhs_val)) = (
+                self.get(lhs).try_as_const_integer(),
+                self.get(rhs).try_as_const_integer(),
+            )
+        {
+            return self
+                .constant(TypeValue::const_integer_from(lhs_val & rhs_val));
+        }
+
         let expr_id = ExprId::from(self.nodes.len());
         self.parents[lhs.0 as usize] = expr_id;
         self.parents[rhs.0 as usize] = expr_id;
@@ -1176,6 +1471,16 @@ impl IR {
 
     /// Creates a new [`Expr::BitwiseOr`].
     pub fn bitwise_or(&mut self, lhs: ExprId, rhs: ExprId) -> ExprId {
+        if self.constant_folding
+            && let (Some(lhs_val), Some(rhs_val)) = (
+                self.get(lhs).try_as_const_integer(),
+                self.get(rhs).try_as_const_integer(),
+            )
+        {
+            return self
+                .constant(TypeValue::const_integer_from(lhs_val | rhs_val));
+        }
+
         let expr_id = ExprId::from(self.nodes.len());
         self.parents[lhs.0 as usize] = expr_id;
         self.parents[rhs.0 as usize] = expr_id;
@@ -1187,6 +1492,16 @@ impl IR {
 
     /// Creates a new [`Expr::BitwiseXor`].
     pub fn bitwise_xor(&mut self, lhs: ExprId, rhs: ExprId) -> ExprId {
+        if self.constant_folding
+            && let (Some(lhs_val), Some(rhs_val)) = (
+                self.get(lhs).try_as_const_integer(),
+                self.get(rhs).try_as_const_integer(),
+            )
+        {
+            return self
+                .constant(TypeValue::const_integer_from(lhs_val ^ rhs_val));
+        }
+
         let expr_id = ExprId::from(self.nodes.len());
         self.parents[lhs.0 as usize] = expr_id;
         self.parents[rhs.0 as usize] = expr_id;
@@ -1198,6 +1513,18 @@ impl IR {
 
     /// Creates a new [`Expr::Shl`].
     pub fn shl(&mut self, lhs: ExprId, rhs: ExprId) -> ExprId {
+        if self.constant_folding
+            && let (Some(lhs_val), Some(rhs_val)) = (
+                self.get(lhs).try_as_const_integer(),
+                self.get(rhs).try_as_const_integer(),
+            )
+            && rhs_val >= 0
+        {
+            return self.constant(TypeValue::const_integer_from(
+                if rhs_val >= 64 { 0 } else { lhs_val << rhs_val },
+            ));
+        }
+
         let expr_id = ExprId::from(self.nodes.len());
         self.parents[lhs.0 as usize] = expr_id;
         self.parents[rhs.0 as usize] = expr_id;
@@ -1209,6 +1536,18 @@ impl IR {
 
     /// Creates a new [`Expr::Shr`].
     pub fn shr(&mut self, lhs: ExprId, rhs: ExprId) -> ExprId {
+        if self.constant_folding
+            && let (Some(lhs_val), Some(rhs_val)) = (
+                self.get(lhs).try_as_const_integer(),
+                self.get(rhs).try_as_const_integer(),
+            )
+            && rhs_val >= 0
+        {
+            return self.constant(TypeValue::const_integer_from(
+                if rhs_val >= 64 { 0 } else { lhs_val >> rhs_val },
+            ));
+        }
+
         let expr_id = ExprId::from(self.nodes.len());
         self.parents[lhs.0 as usize] = expr_id;
         self.parents[rhs.0 as usize] = expr_id;
@@ -1498,6 +1837,20 @@ impl IR {
         expr_id
     }
 
+    /// Creates a new [`Expr::MatchesMany`].
+    pub fn matches_regex_set(
+        &mut self,
+        lhs: ExprId,
+        regex_set: RegexSetId,
+    ) -> ExprId {
+        let expr_id = ExprId::from(self.nodes.len());
+        self.parents[lhs.0 as usize] = expr_id;
+        self.parents.push(ExprId::none());
+        self.nodes.push(Expr::MatchesMany { lhs, regex_set });
+        debug_assert_eq!(self.parents.len(), self.nodes.len());
+        expr_id
+    }
+
     /// Creates a new [`Expr::PatternMatch`]
     pub fn pattern_match(
         &mut self,
@@ -1675,7 +2028,6 @@ impl IR {
         &mut self,
         quantifier: Quantifier,
         for_vars: ForVars,
-        next_expr_var: Var,
         items: Vec<ExprId>,
         anchor: MatchAnchor,
     ) -> ExprId {
@@ -1705,7 +2057,6 @@ impl IR {
             items,
             anchor,
             for_vars,
-            next_expr_var,
         })));
         debug_assert_eq!(self.parents.len(), self.nodes.len());
         expr_id
@@ -1716,7 +2067,6 @@ impl IR {
         &mut self,
         quantifier: Quantifier,
         for_vars: ForVars,
-        next_pattern_var: Var,
         items: Vec<PatternIdx>,
         anchor: MatchAnchor,
     ) -> ExprId {
@@ -1743,7 +2093,6 @@ impl IR {
             items,
             anchor,
             for_vars,
-            next_pattern_var,
         })));
         debug_assert_eq!(self.parents.len(), self.nodes.len());
         expr_id
@@ -1753,7 +2102,6 @@ impl IR {
     pub fn for_of(
         &mut self,
         quantifier: Quantifier,
-        variable: Var,
         for_vars: ForVars,
         pattern_set: Vec<PatternIdx>,
         body: ExprId,
@@ -1769,7 +2117,6 @@ impl IR {
         self.parents.push(ExprId::none());
         self.nodes.push(Expr::ForOf(Box::new(ForOf {
             quantifier,
-            variable,
             pattern_set,
             body,
             for_vars,
@@ -1784,7 +2131,6 @@ impl IR {
         quantifier: Quantifier,
         variables: Vec<Var>,
         for_vars: ForVars,
-        iterable_var: Var,
         iterable: Iterable,
         body: ExprId,
     ) -> ExprId {
@@ -1815,7 +2161,6 @@ impl IR {
             quantifier,
             variables,
             for_vars,
-            iterable_var,
             iterable,
             body,
         })));
@@ -1914,108 +2259,121 @@ impl Debug for IR {
             match event {
                 Event::Leave(_) => level -= 1,
                 Event::Enter((expr_id, expr,_)) => {
-                    for _ in 0..level {
-                        write!(f, "  ")?;
-                    }
+                    let indentation = "  ".repeat(level);
                     level += 1;
-                    write!(f, "{expr_id:?}: ")?;
+                    write!(f, "{indentation}{expr_id:?}: ")?;
                     let expr_hash = expr_hashes[expr_id.0 as usize];
                     match expr {
-                        Expr::Const(c) => write!(f, "CONST {c}")?,
-                        Expr::Filesize => write!(f, "FILESIZE")?,
-                        Expr::Not { .. } => write!(f, "NOT -- hash: {expr_hash:#08x}")?,
-                        Expr::And { .. } => write!(f, "AND -- hash: {expr_hash:#08x}")?,
-                        Expr::Or { .. } => write!(f, "OR -- hash: {expr_hash:#08x}")?,
-                        Expr::Minus { .. } => write!(f, "MINUS -- hash: {expr_hash:#08x}")?,
-                        Expr::Add { .. } => write!(f, "ADD -- hash: {expr_hash:#08x}")?,
-                        Expr::Sub { .. } => write!(f, "SUB -- hash: {expr_hash:#08x}")?,
-                        Expr::Mul { .. } => write!(f, "MUL -- hash: {expr_hash:#08x}")?,
-                        Expr::Div { .. } => write!(f, "DIV -- hash: {expr_hash:#08x}")?,
-                        Expr::Mod { .. } => write!(f, "MOD -- hash: {expr_hash:#08x}")?,
-                        Expr::Shl { .. } => write!(f, "SHL -- hash: {expr_hash:#08x}")?,
-                        Expr::Shr { .. } => write!(f, "SHR -- hash: {expr_hash:#08x}")?,
-                        Expr::Eq { .. } => write!(f, "EQ -- hash: {expr_hash:#08x}")?,
-                        Expr::Ne { .. } => write!(f, "NE -- hash: {expr_hash:#08x}")?,
-                        Expr::Lt { .. } => write!(f, "LT -- hash: {expr_hash:#08x}")?,
-                        Expr::Gt { .. } => write!(f, "GT -- hash: {expr_hash:#08x}")?,
-                        Expr::Le { .. } => write!(f, "LE -- hash: {expr_hash:#08x}")?,
-                        Expr::Ge { .. } => write!(f, "GE -- hash: {expr_hash:#08x}")?,
-                        Expr::BitwiseNot { .. } => write!(f, "BITWISE_NOT -- hash: {expr_hash:#08x}")?,
-                        Expr::BitwiseAnd { .. } => write!(f, "BITWISE_AND -- hash: {expr_hash:#08x}")?,
-                        Expr::BitwiseOr { .. } => write!(f, "BITWISE_OR -- hash: {expr_hash:#08x}")?,
-                        Expr::BitwiseXor { .. } => write!(f, "BITWISE_XOR -- hash: {expr_hash:#08x}")?,
-                        Expr::Contains { .. } => write!(f, "CONTAINS -- hash: {expr_hash:#08x}")?,
-                        Expr::IContains { .. } => write!(f, "ICONTAINS -- hash: {expr_hash:#08x}")?,
-                        Expr::StartsWith { .. } => write!(f, "STARTS_WITH -- hash: {expr_hash:#08x}")?,
-                        Expr::IStartsWith { .. } => write!(f, "ISTARTS_WITH -- hash: {expr_hash:#08x}")?,
-                        Expr::EndsWith { .. } => write!(f, "ENDS_WITH -- hash: {expr_hash:#08x}")?,
-                        Expr::IEndsWith { .. } => write!(f, "IENDS_WITH -- hash: {expr_hash:#08x}")?,
-                        Expr::IEquals { .. } => write!(f, "IEQUALS -- hash: {expr_hash:#08x}")?,
-                        Expr::Matches { .. } => write!(f, "MATCHES -- hash: {expr_hash:#08x}")?,
-                        Expr::Defined { .. } => write!(f, "DEFINED -- hash: {expr_hash:#08x}")?,
-                        Expr::FieldAccess { .. } => write!(f, "FIELD_ACCESS -- hash: {expr_hash:#08x}")?,
-                        Expr::With { .. } => write!(f, "WITH -- hash: {expr_hash:#08x}")?,
-                        Expr::Symbol(symbol) => write!(f, "SYMBOL {symbol:?}")?,
-                        Expr::OfExprTuple(_) => write!(f, "OF -- hash: {expr_hash:#08x}")?,
-                        Expr::OfPatternSet(_) => write!(f, "OF -- hash: {expr_hash:#08x}")?,
-                        Expr::ForOf(_) => write!(f, "FOR_OF -- hash: {expr_hash:#08x}")?,
-                        Expr::ForIn(_) => write!(f, "FOR_IN -- hash: {expr_hash:#08x}")?,
-                        Expr::Lookup(_) => write!(f, "LOOKUP -- hash: {expr_hash:#08x}")?,
-                        Expr::FuncCall(func_call) => write!(f,
+                        Expr::Const(c) => writeln!(f, "CONST {c}")?,
+                        Expr::Filesize => writeln!(f, "FILESIZE")?,
+                        Expr::Not { .. } => writeln!(f, "NOT -- hash: {expr_hash:#08x}")?,
+                        Expr::And { .. } => writeln!(f, "AND -- hash: {expr_hash:#08x}")?,
+                        Expr::Or { .. } => writeln!(f, "OR -- hash: {expr_hash:#08x}")?,
+                        Expr::Minus { .. } => writeln!(f, "MINUS -- hash: {expr_hash:#08x}")?,
+                        Expr::Add { .. } => writeln!(f, "ADD -- hash: {expr_hash:#08x}")?,
+                        Expr::Sub { .. } => writeln!(f, "SUB -- hash: {expr_hash:#08x}")?,
+                        Expr::Mul { .. } => writeln!(f, "MUL -- hash: {expr_hash:#08x}")?,
+                        Expr::Div { .. } => writeln!(f, "DIV -- hash: {expr_hash:#08x}")?,
+                        Expr::Mod { .. } => writeln!(f, "MOD -- hash: {expr_hash:#08x}")?,
+                        Expr::Shl { .. } => writeln!(f, "SHL -- hash: {expr_hash:#08x}")?,
+                        Expr::Shr { .. } => writeln!(f, "SHR -- hash: {expr_hash:#08x}")?,
+                        Expr::Eq { .. } => writeln!(f, "EQ -- hash: {expr_hash:#08x}")?,
+                        Expr::Ne { .. } => writeln!(f, "NE -- hash: {expr_hash:#08x}")?,
+                        Expr::Lt { .. } => writeln!(f, "LT -- hash: {expr_hash:#08x}")?,
+                        Expr::Gt { .. } => writeln!(f, "GT -- hash: {expr_hash:#08x}")?,
+                        Expr::Le { .. } => writeln!(f, "LE -- hash: {expr_hash:#08x}")?,
+                        Expr::Ge { .. } => writeln!(f, "GE -- hash: {expr_hash:#08x}")?,
+                        Expr::BitwiseNot { .. } => writeln!(f, "BITWISE_NOT -- hash: {expr_hash:#08x}")?,
+                        Expr::BitwiseAnd { .. } => writeln!(f, "BITWISE_AND -- hash: {expr_hash:#08x}")?,
+                        Expr::BitwiseOr { .. } => writeln!(f, "BITWISE_OR -- hash: {expr_hash:#08x}")?,
+                        Expr::BitwiseXor { .. } => writeln!(f, "BITWISE_XOR -- hash: {expr_hash:#08x}")?,
+                        Expr::Contains { .. } => writeln!(f, "CONTAINS -- hash: {expr_hash:#08x}")?,
+                        Expr::IContains { .. } => writeln!(f, "ICONTAINS -- hash: {expr_hash:#08x}")?,
+                        Expr::StartsWith { .. } => writeln!(f, "STARTS_WITH -- hash: {expr_hash:#08x}")?,
+                        Expr::IStartsWith { .. } => writeln!(f, "ISTARTS_WITH -- hash: {expr_hash:#08x}")?,
+                        Expr::EndsWith { .. } => writeln!(f, "ENDS_WITH -- hash: {expr_hash:#08x}")?,
+                        Expr::IEndsWith { .. } => writeln!(f, "IENDS_WITH -- hash: {expr_hash:#08x}")?,
+                        Expr::IEquals { .. } => writeln!(f, "IEQUALS -- hash: {expr_hash:#08x}")?,
+                        Expr::Matches { .. } => writeln!(f, "MATCHES -- hash: {expr_hash:#08x}")?,
+                        Expr::MatchesMany { regex_set, .. } => writeln!(f, "MATCHES_MANY RegexSetId({}) -- hash: {expr_hash:#08x}", usize::from(*regex_set))?,
+                        Expr::Defined { .. } => writeln!(f, "DEFINED -- hash: {expr_hash:#08x}")?,
+                        Expr::FieldAccess { .. } => writeln!(f, "FIELD_ACCESS -- hash: {expr_hash:#08x}")?,
+                        Expr::With { .. } => writeln!(f, "WITH -- hash: {expr_hash:#08x}")?,
+                        Expr::Symbol(symbol) => writeln!(f, "SYMBOL {symbol:?}")?,
+                        Expr::OfExprTuple(_) => writeln!(f, "OF -- hash: {expr_hash:#08x}")?,
+                        Expr::OfPatternSet(_) => writeln!(f, "OF -- hash: {expr_hash:#08x}")?,
+                        Expr::ForOf(for_of) => {
+                            writeln!(f, "FOR_OF -- hash: {expr_hash:#08x}")?;
+                            writeln!(f, "{indentation}      n: {:?}", for_of.for_vars.n)?;
+                            writeln!(f, "{indentation}      i: {:?}", for_of.for_vars.i)?;
+                            writeln!(f, "{indentation}      max_count: {:?}", for_of.for_vars.max_count)?;
+                            writeln!(f, "{indentation}      count: {:?}", for_of.for_vars.count)?;
+                            writeln!(f, "{indentation}      item: {:?}", for_of.for_vars.item)?;
+                        },
+                        Expr::ForIn(for_in) => {
+                            writeln!(f, "FOR_IN -- hash: {expr_hash:#08x}")?;
+                            writeln!(f, "{indentation}      n: {:?}", for_in.for_vars.n)?;
+                            writeln!(f, "{indentation}      i: {:?}", for_in.for_vars.i)?;
+                            writeln!(f, "{indentation}      max_count: {:?}", for_in.for_vars.max_count)?;
+                            writeln!(f, "{indentation}      count: {:?}", for_in.for_vars.count)?;
+                            writeln!(f, "{indentation}      item: {:?}", for_in.for_vars.item)?;
+                        },
+                        Expr::Lookup(_) => writeln!(f, "LOOKUP -- hash: {expr_hash:#08x}")?,
+                        Expr::FuncCall(func_call) => writeln!(f,
                             "FN_CALL {} -- hash: {:#08x}",
                             func_call.mangled_name(),
                             expr_hash
                         )?,
-                        Expr::PatternMatch { pattern, anchor } => write!(
+                        Expr::PatternMatch { pattern, anchor } => writeln!(
                             f,
                             "PATTERN_MATCH {:?}{} -- hash: {:#08x}",
                             pattern,
                             anchor_str(anchor),
                             expr_hash
                         )?,
-                        Expr::PatternMatchVar { symbol, anchor } => write!(
+                        Expr::PatternMatchVar { symbol, anchor } => writeln!(
                             f,
                             "PATTERN_MATCH {:?}{} -- hash: {:#08x}",
                             symbol,
                             anchor_str(anchor),
                             expr_hash
                         )?,
-                        Expr::PatternCount { pattern, range } => write!(
+                        Expr::PatternCount { pattern, range } => writeln!(
                             f,
                             "PATTERN_COUNT {:?}{} -- hash: {:#08x}",
                             pattern,
                             range_str(range),
                             expr_hash
                         )?,
-                        Expr::PatternCountVar { symbol, range } => write!(
+                        Expr::PatternCountVar { symbol, range } => writeln!(
                             f,
                             "PATTERN_COUNT {:?}{} -- hash: {:#08x}",
                             symbol,
                             range_str(range),
                             expr_hash
                         )?,
-                        Expr::PatternOffset { pattern, index } => write!(
+                        Expr::PatternOffset { pattern, index } => writeln!(
                             f,
                             "PATTERN_OFFSET {:?}{} -- hash: {:#08x}",
                             pattern,
                             index_str(index),
                             expr_hash
                         )?,
-                        Expr::PatternOffsetVar { symbol, index } => write!(
+                        Expr::PatternOffsetVar { symbol, index } => writeln!(
                             f,
                             "PATTERN_OFFSET {:?}{} -- hash: {:#08x}",
                             symbol,
                             index_str(index),
                             expr_hash
                         )?,
-                        Expr::PatternLength { pattern, index } => write!(
+                        Expr::PatternLength { pattern, index } => writeln!(
                             f,
                             "PATTERN_LENGTH {:?}{} -- hash: {:#08x}",
                             pattern,
                             index_str(index),
                             expr_hash
                         )?,
-                        Expr::PatternLengthVar { symbol, index } => write!(
+                        Expr::PatternLengthVar { symbol, index } => writeln!(
                             f,
                             "PATTERN_LENGTH {:?}{} -- hash: {:#08x}",
                             symbol,
@@ -2023,8 +2381,6 @@ impl Debug for IR {
                             expr_hash
                         )?,
                     }
-                    writeln!(f, " -- parent: {:?} ", self.parents[expr_id.0 as usize])?;
-
                 }
             }
         }
@@ -2032,7 +2388,6 @@ impl Debug for IR {
         Ok(())
     }
 }
-
 /// Iterator that returns the ancestors for a given expression in the
 /// IR tree.
 ///
@@ -2176,6 +2531,10 @@ pub(crate) enum Expr {
     /// `matches` expression.
     Matches { rhs: ExprId, lhs: ExprId },
 
+    /// Match expression similar to `Expr::Matches` but that matches against
+    /// multiple regular expressions at the same time.
+    MatchesMany { lhs: ExprId, regex_set: RegexSetId },
+
     /// A `defined` expression (e.g. `defined foo`)
     Defined { operand: ExprId },
 
@@ -2267,6 +2626,12 @@ impl FuncCall {
     pub fn mangled_name(&self) -> &str {
         self.signature().mangled_name.as_str()
     }
+
+    /// Returns the plain function name, without argument or return type
+    /// information (i.e: everything before the `@` in the name).
+    pub fn plain_name(&self) -> &str {
+        self.signature().mangled_name.plain_name()
+    }
 }
 
 /// An `of` expression with a tuple of expressions (e.g. `1 of (true, false)`).
@@ -2274,7 +2639,6 @@ pub(crate) struct OfExprTuple {
     pub quantifier: Quantifier,
     pub items: Vec<ExprId>,
     pub for_vars: ForVars,
-    pub next_expr_var: Var,
     pub anchor: MatchAnchor,
 }
 
@@ -2283,7 +2647,6 @@ pub(crate) struct OfPatternSet {
     pub quantifier: Quantifier,
     pub items: Vec<PatternIdx>,
     pub for_vars: ForVars,
-    pub next_pattern_var: Var,
     pub anchor: MatchAnchor,
 }
 
@@ -2291,7 +2654,6 @@ pub(crate) struct OfPatternSet {
 /// `for 1 of ($a,$b) : (..)`)
 pub(crate) struct ForOf {
     pub quantifier: Quantifier,
-    pub variable: Var,
     pub for_vars: ForVars,
     pub pattern_set: Vec<PatternIdx>,
     pub body: ExprId,
@@ -2302,7 +2664,6 @@ pub(crate) struct ForIn {
     pub quantifier: Quantifier,
     pub variables: Vec<Var>,
     pub for_vars: ForVars,
-    pub iterable_var: Var,
     pub iterable: Iterable,
     pub body: ExprId,
 }
@@ -2317,7 +2678,6 @@ pub(crate) enum Quantifier {
 }
 
 /// Variables used in `for` loop.
-#[derive(PartialEq, Eq)]
 pub(crate) struct ForVars {
     /// Maximum number of iterations.
     pub n: Var,
@@ -2327,6 +2687,8 @@ pub(crate) struct ForVars {
     pub max_count: Var,
     /// Number of loop iterations that actually returned true.
     pub count: Var,
+    /// Variable that holds the current item.
+    pub item: Var,
 }
 
 impl ForVars {
@@ -2335,6 +2697,7 @@ impl ForVars {
         self.i.shift(after, amount);
         self.max_count.shift(after, amount);
         self.count.shift(after, amount);
+        self.item.shift(after, amount);
     }
 }
 
@@ -2513,12 +2876,10 @@ impl Expr {
             }
 
             Expr::OfExprTuple(of) => {
-                of.next_expr_var.shift(from_index, shift_amount);
                 of.for_vars.shift(from_index, shift_amount);
             }
 
             Expr::OfPatternSet(of) => {
-                of.next_pattern_var.shift(from_index, shift_amount);
                 of.for_vars.shift(from_index, shift_amount);
             }
 
@@ -2527,7 +2888,6 @@ impl Expr {
             }
 
             Expr::ForIn(for_in) => {
-                for_in.iterable_var.shift(from_index, shift_amount);
                 for v in for_in.variables.iter_mut() {
                     v.shift(from_index, shift_amount)
                 }
@@ -2626,6 +2986,11 @@ impl Expr {
                 }
                 if *rhs == child {
                     *rhs = replacement;
+                }
+            }
+            Expr::MatchesMany { lhs, .. } => {
+                if *lhs == child {
+                    *lhs = replacement;
                 }
             }
             Expr::PatternMatch { anchor, .. }
@@ -2732,6 +3097,7 @@ impl Expr {
             | Expr::IEndsWith { .. }
             | Expr::IEquals { .. }
             | Expr::Matches { .. }
+            | Expr::MatchesMany { .. }
             | Expr::PatternMatch { .. }
             | Expr::PatternMatchVar { .. }
             | Expr::OfExprTuple(_)
@@ -2803,6 +3169,7 @@ impl Expr {
             | Expr::IEndsWith { .. }
             | Expr::IEquals { .. }
             | Expr::Matches { .. }
+            | Expr::MatchesMany { .. }
             | Expr::PatternMatch { .. }
             | Expr::PatternMatchVar { .. }
             | Expr::OfExprTuple(_)

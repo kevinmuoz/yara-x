@@ -87,6 +87,12 @@ class Compiler:
         """
         ...
 
+    def max_warnings(self, n: int) -> None:
+        r"""
+        Sets the maximum number of warnings.
+        """
+        ...
+
     def define_global(self, ident: str, value: Any) -> None:
         r"""
         Defines a global variable and sets its initial value.
@@ -279,6 +285,20 @@ class Scanner:
         Sets the maximum number of matches per pattern.
 
         When some pattern reaches the specified number of `matches` it won't produce more matches.
+        """
+        ...
+
+    def fast_scan(self, yes: bool) -> None:
+        r"""
+        Enables or disables fast scan mode.
+
+        In fast scan mode, the scanner avoids tracking matches for patterns when
+        it is not necessary (e.g. when a rule condition only performs a simple
+        boolean check `$a`).
+
+        Note that using fast scan mode implies that not all matches will be
+        reported. For instance, when iterating matches, you won't get all occurrences
+        of the pattern in the file, only the first one.
         """
         ...
 

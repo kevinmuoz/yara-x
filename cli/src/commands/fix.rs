@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Context;
 use clap::{Arg, ArgAction, ArgMatches, Command, arg, value_parser};
-use superconsole::{Component, Line, Lines, Span};
 use yansi::Color::{Green, Red, Yellow};
 use yansi::Paint;
 use yara_x::Patch;
@@ -18,6 +17,7 @@ use crate::commands::{
     compilation_args, compile_rules, path_with_namespace_parser,
 };
 use crate::config::Config;
+use crate::walk::Draw;
 use crate::walk::Message;
 use crate::{help, walk};
 
@@ -124,14 +124,17 @@ pub fn exec_fix_encoding(
             })?;
 
             // Detect the original encoding.
-            let mut detector = chardetng::EncodingDetector::new();
+            let mut detector = chardetng::EncodingDetector::new(
+                chardetng::Iso2022JpDetection::Allow,
+            );
             detector.feed(src.as_slice(), true);
 
             // Decode the source file as UTF-8. `invalid_chars` will be true
             // if some character could not be encoded as UTF-8 and was replaced
             // by the replacement character.
-            let (src_utf8, encoding, invalid_chars) =
-                detector.guess(None, true).decode(src.as_slice());
+            let (src_utf8, encoding, invalid_chars) = detector
+                .guess(None, chardetng::Utf8Detection::Allow)
+                .decode(src.as_slice());
 
             // Re-write the source as UTF-8, except if --dry-run was used or
             // the original source was not modified at all.
@@ -247,24 +250,13 @@ impl FixEncodingState {
     }
 }
 
-impl Component for FixEncodingState {
-    fn draw_unchecked(
-        &self,
-        _dimensions: superconsole::Dimensions,
-        mode: superconsole::DrawMode,
-    ) -> anyhow::Result<superconsole::Lines> {
-        let res = match mode {
-            superconsole::DrawMode::Normal | superconsole::DrawMode::Final => {
-                let modified = format!(
-                    "{} file(s) modified.",
-                    self.files_modified.load(Ordering::Relaxed)
-                );
+impl Draw for FixEncodingState {
+    fn draw(&self, _width: usize) -> String {
+        let modified = format!(
+            "{} file(s) modified.",
+            self.files_modified.load(Ordering::Relaxed)
+        );
 
-                Line::from_iter([Span::new_unstyled(
-                    modified.paint(Green).bold(),
-                )?])
-            }
-        };
-        Ok(Lines(vec![res]))
+        format!("{}", modified.paint(Green).bold())
     }
 }

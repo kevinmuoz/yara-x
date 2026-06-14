@@ -85,22 +85,19 @@ use std::rc::Rc;
 use std::sync::{LazyLock, OnceLock};
 
 use bstr::{BString, ByteSlice};
-#[cfg(not(feature = "inventory"))]
-use linkme::distributed_slice;
 use rustc_hash::FxHashMap;
 use smallvec::{SmallVec, smallvec};
 use yara_x_macros::wasm_export;
 
-use crate::compiler::{LiteralId, PatternId, RegexpId, RuleId};
-use crate::modules::BUILTIN_MODULES;
+use crate::compiler::{LiteralId, PatternId, RegexId, RuleId};
 use crate::scanner::{RuntimeObjectHandle, ScanContext};
 use crate::types::{
     Array, Func, FuncSignature, Map, Struct, TypeValue, Value,
 };
 use crate::wasm::integer::RangedInteger;
 use crate::wasm::runtime::{
-    AsContext, AsContextMut, Caller, Config, Engine, FuncType, Linker, ValRaw,
-    ValType,
+    AsContext, AsContextMut, Caller, Config, Engine, FuncType, Linker,
+    Trampoline, TrampolineResult, ValRaw, ValType,
 };
 use crate::wasm::string::RuntimeString;
 use crate::wasm::string::String as _;
@@ -131,32 +128,16 @@ pub(crate) const LOOKUP_INDEXES_END: i32 = LOOKUP_INDEXES_START + 1024;
 /// bit is set, it indicates that the rule with RuleId = N matched.
 pub(crate) const MATCHING_RULES_BITMAP_BASE: i32 = LOOKUP_INDEXES_END;
 
-/// Global slice that contains an entry for each function that is callable from
-/// WASM code. Functions with attributes `#[wasm_export]` and `#[module_export]`
-/// are automatically added to this slice. See https://github.com/dtolnay/linkme
-/// for details about how `#[distributed_slice]` works.
-///
-/// When the `inventory` feature is enabled, this vector is not used.
-#[cfg(not(feature = "inventory"))]
-#[distributed_slice]
-pub(crate) static WASM_EXPORTS: [WasmExport] = [..];
-
-#[cfg(feature = "inventory")]
 inventory::collect!(WasmExport);
 
 /// Returns an iterator of [`WasmExport`] structs that describes the functions
 /// that are callable from WASM code.
 pub(crate) fn wasm_exports() -> impl Iterator<Item = &'static WasmExport> {
-    #[cfg(feature = "inventory")]
-    return inventory::iter::<WasmExport>();
-
-    // Rely on the `WASM_EXPORTS` slice when not using the `inventory` crate.
-    #[cfg(not(feature = "inventory"))]
-    WASM_EXPORTS.iter()
+    inventory::iter::<WasmExport>()
 }
 
-/// Type of each entry in [`WASM_EXPORTS`].
-pub(crate) struct WasmExport {
+/// Describes a function that is exported to WASM code.
+pub struct WasmExport {
     /// Function's name.
     pub name: &'static str,
     /// Function's mangled name. The mangled name contains information about
@@ -188,15 +169,15 @@ impl WasmExport {
     ///
     /// The fully qualified name includes not only the function's name, but
     /// also the module's name (e.g: `my_module.my_struct.my_func@ii@i`)
-    pub fn fully_qualified_mangled_name(&self) -> String {
+    pub(crate) fn fully_qualified_mangled_name(&self) -> String {
         if self.method_of.is_some() {
             return self.mangled_name.to_string();
         }
-        for (module_name, module) in BUILTIN_MODULES.iter() {
-            if let Some(rust_module_name) = module.rust_module_name
+        for module in crate::modules::registered_modules() {
+            if let Some(rust_module_name) = module.rust_module_name()
                 && self.rust_module_path.contains(rust_module_name)
             {
-                return format!("{}.{}", module_name, self.mangled_name);
+                return format!("{}.{}", module.name(), self.mangled_name);
             }
         }
         self.mangled_name.to_owned()
@@ -214,7 +195,9 @@ impl WasmExport {
     /// Keys are function names and values are [`Func`] structures. Overloaded
     /// functions appear in the map as a single entry where the [`Func`] has
     /// multiple signatures.
-    pub fn get_functions<P>(predicate: P) -> FxHashMap<&'static str, Func>
+    pub(crate) fn get_functions<P>(
+        predicate: P,
+    ) -> FxHashMap<&'static str, Func>
     where
         P: FnMut(&&WasmExport) -> bool,
     {
@@ -264,7 +247,9 @@ impl WasmExport {
     /// #[module_export(method_of = "my_module.MyStructure")]
     /// fn some_method(...) { ... }
     /// ```
-    pub fn get_methods(type_name: &str) -> FxHashMap<&'static str, Func> {
+    pub(crate) fn get_methods(
+        type_name: &str,
+    ) -> FxHashMap<&'static str, Func> {
         WasmExport::get_functions(|export| {
             export.method_of.is_some_and(|name| name == type_name)
         })
@@ -276,10 +261,10 @@ impl WasmExport {
 /// Implementors of this trait are [`WasmExportedFn0`], [`WasmExportedFn1`],
 /// [`WasmExportedFn2`], etc. Each of these types is a generic type that
 /// represents all functions with 0, 1, and 2 arguments respectively.
-pub(crate) trait WasmExportedFn {
+pub trait WasmExportedFn {
     /// Returns the function that will be passed to the selected runtime linker
     /// while linking the WASM code to this function.
-    fn trampoline(&'static self) -> TrampolineFn;
+    fn trampoline(&'static self) -> Trampoline<ScanContext<'static, 'static>>;
 
     /// Returns a [`Vec<ValType>`] with the types of the function's
     /// arguments
@@ -301,13 +286,6 @@ pub(crate) trait WasmExportedFn {
         self.wasmtime_results().iter().map(wasmtime_to_walrus).collect()
     }
 }
-
-type TrampolineFn = Box<
-    dyn Fn(Caller<'_, ScanContext>, &mut [ValRaw]) -> wasmtime::Result<()>
-        + Send
-        + Sync
-        + 'static,
->;
 
 const MAX_RESULTS: usize = 4;
 type WasmResultArray<T> = SmallVec<[T; MAX_RESULTS]>;
@@ -379,10 +357,10 @@ impl WasmArg<LiteralId> for ValRaw {
     }
 }
 
-impl WasmArg<RegexpId> for ValRaw {
+impl WasmArg<RegexId> for ValRaw {
     #[inline]
-    fn raw_into(self, _: &mut ScanContext) -> RegexpId {
-        RegexpId::from(self.get_i32())
+    fn raw_into(self, _: &mut ScanContext) -> RegexId {
+        RegexId::from(self.get_i32())
     }
 }
 
@@ -597,7 +575,7 @@ where
     }
 }
 
-pub fn wasmtime_to_walrus(ty: &ValType) -> walrus::ValType {
+fn wasmtime_to_walrus(ty: &ValType) -> walrus::ValType {
     #[allow(unreachable_patterns)]
     match ty {
         ValType::I64 => walrus::ValType::I64,
@@ -629,7 +607,7 @@ fn type_id_to_wasmtime(
         return &[ValType::I32];
     } else if type_id == TypeId::of::<RuleId>() {
         return &[ValType::I32];
-    } else if type_id == TypeId::of::<RegexpId>() {
+    } else if type_id == TypeId::of::<RegexId>() {
         return &[ValType::I32];
     } else if type_id == TypeId::of::<()>() {
         return &[];
@@ -652,7 +630,8 @@ fn type_id_to_wasmtime(
 macro_rules! impl_wasm_exported_fn {
     ($name:ident $($args:ident)*) => {
         #[allow(dead_code)]
-        pub(super) struct $name <$($args,)* R>
+        #[allow(missing_docs)]
+        pub struct $name <$($args,)* R>
         where
             $($args: 'static,)*
             R: 'static,
@@ -689,11 +668,11 @@ macro_rules! impl_wasm_exported_fn {
             #[allow(unused_variables)]
             #[allow(non_snake_case)]
             #[allow(unused_mut)]
-            fn trampoline(&'static self) -> TrampolineFn {
+            fn trampoline(&'static self) -> Trampoline<ScanContext<'static, 'static>> {
                 Box::new(
                     |mut caller: Caller<'_, ScanContext>,
                      args_and_results: &mut [ValRaw]|
-                     -> wasmtime::Result<()> {
+                     -> TrampolineResult {
                         let mut i = 0;
                         $(
                             let $args = args_and_results[i].raw_into(caller.data_mut());
@@ -708,7 +687,7 @@ macro_rules! impl_wasm_exported_fn {
 
                         args_and_results[0..num_results].clone_from_slice(result_slice);
 
-                        wasmtime::Result::Ok(())
+                        TrampolineResult::Ok(())
                     },
                 )
             }
@@ -766,6 +745,14 @@ pub(crate) static CONFIG: LazyLock<Config> = LazyLock::new(|| {
     //
     #[cfg(target_env = "musl")]
     config.native_unwind_info(false);
+
+    #[cfg(feature = "pulley")]
+    {
+        #[cfg(target_pointer_width = "64")]
+        config.target("pulley64").unwrap();
+        #[cfg(target_pointer_width = "32")]
+        config.target("pulley32").unwrap();
+    }
 
     config.cranelift_opt_level(runtime::OptLevel::SpeedAndSize);
     config.epoch_interruption(true);
@@ -940,7 +927,9 @@ pub(crate) fn is_pat_match_at(
     if offset < 0 {
         return false;
     }
-    if let Some(matches) = caller.data().pattern_matches.get(pattern_id) {
+    if let Some(matches) =
+        caller.data().tracker.pattern_matches.get(pattern_id)
+    {
         matches.search(offset.try_into().unwrap()).is_ok()
     } else {
         false
@@ -959,7 +948,9 @@ pub(crate) fn is_pat_match_in(
     lower_bound: i64,
     upper_bound: i64,
 ) -> bool {
-    if let Some(matches) = caller.data().pattern_matches.get(pattern_id) {
+    if let Some(matches) =
+        caller.data().tracker.pattern_matches.get(pattern_id)
+    {
         matches
             .matches_in_range(lower_bound as isize..=upper_bound as isize)
             .is_positive()
@@ -993,6 +984,7 @@ pub(crate) fn pat_range_match(
 
     for pattern_id in range {
         let match_found = ctx
+            .tracker
             .pattern_matches
             .get(pattern_id.into())
             .is_some_and(|matches| matches.len() > 0);
@@ -1011,7 +1003,9 @@ pub(crate) fn pat_matches(
     caller: &mut Caller<'_, ScanContext>,
     pattern_id: PatternId,
 ) -> i64 {
-    if let Some(matches) = caller.data().pattern_matches.get(pattern_id) {
+    if let Some(matches) =
+        caller.data().tracker.pattern_matches.get(pattern_id)
+    {
         matches.len().try_into().unwrap()
     } else {
         0
@@ -1030,7 +1024,9 @@ pub(crate) fn pat_matches_in(
     lower_bound: i64,
     upper_bound: i64,
 ) -> i64 {
-    if let Some(matches) = caller.data().pattern_matches.get(pattern_id) {
+    if let Some(matches) =
+        caller.data().tracker.pattern_matches.get(pattern_id)
+    {
         matches.matches_in_range(lower_bound as isize..=upper_bound as isize)
     } else {
         0
@@ -1048,7 +1044,9 @@ pub(crate) fn pat_length(
     pattern_id: PatternId,
     index: i64,
 ) -> Option<i64> {
-    if let Some(matches) = caller.data().pattern_matches.get(pattern_id) {
+    if let Some(matches) =
+        caller.data().tracker.pattern_matches.get(pattern_id)
+    {
         let index: usize = index.try_into().ok()?;
         // Index is 1-based, convert it to 0-based before calling `matches.get`
         let m = matches.get(index.checked_sub(1)?)?;
@@ -1069,7 +1067,9 @@ pub(crate) fn pat_offset(
     pattern_id: PatternId,
     index: i64,
 ) -> Option<i64> {
-    if let Some(matches) = caller.data().pattern_matches.get(pattern_id) {
+    if let Some(matches) =
+        caller.data().tracker.pattern_matches.get(pattern_id)
+    {
         let index: usize = index.try_into().ok()?;
         // Index is 1-based, convert it to 0-based before calling `matches.get`
         let m = matches.get(index.checked_sub(1)?)?;
@@ -1142,7 +1142,8 @@ fn lookup_field(
 
     let mem_ptr = store_ctx
         .data_mut()
-        .wasm_main_memory
+        .wasm
+        .main_memory
         .unwrap()
         .data_ptr(&mut store_ctx);
 
@@ -1626,10 +1627,23 @@ pub(crate) fn str_len(
 pub(crate) fn str_matches(
     caller: &mut Caller<'_, ScanContext>,
     lhs: RuntimeString,
-    rhs: RegexpId,
+    rhs: RegexId,
 ) -> bool {
     let ctx = caller.data();
     ctx.regexp_matches(rhs, lhs.as_bstr(ctx))
+}
+
+#[wasm_export(sync = "none")]
+pub(crate) fn str_matches_regex_set(
+    caller: &mut Caller<'_, ScanContext>,
+    lhs: RuntimeString,
+    regex_set: i32,
+) -> bool {
+    let ctx = caller.data();
+    ctx.regex_set_matches(
+        crate::compiler::RegexSetId::from(regex_set),
+        lhs.as_bstr(ctx),
+    )
 }
 
 macro_rules! gen_int_fn {

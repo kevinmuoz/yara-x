@@ -28,7 +28,7 @@ fn serialization() {
     // `DecodeError`.
     let mut data = Vec::new();
     data.extend(b"YARA-X\0\0");
-    data.extend(1u32.to_le_bytes());
+    data.extend(2u32.to_le_bytes());
     data.extend(b"foo");
 
     assert!(matches!(
@@ -1286,6 +1286,27 @@ fn test_switch_all_warnings() {
         .unwrap();
 
     assert_eq!(compiler.warnings().len(), 0);
+}
+
+#[test]
+fn test_max_warnings() {
+    let mut compiler = Compiler::new();
+
+    compiler
+        .max_warnings(1)
+        .add_source(
+            r#"
+            rule test1 {
+                condition: true
+            }
+            rule test2 {
+                condition: true
+            }
+            "#,
+        )
+        .unwrap();
+
+    assert_eq!(compiler.warnings().len(), 1);
 }
 
 #[test]

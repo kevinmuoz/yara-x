@@ -14,13 +14,13 @@ use super::common::{self, RuntimeBackend};
 
 /// Browser runtime backend.
 #[derive(Clone, Default)]
-pub(crate) struct Backend;
+pub struct Backend;
 
 pub(crate) use super::common::{
     AsContext, AsContextMut, Config, Engine, OptLevel,
 };
 /// Alias for [`common::Caller`] specialized for the browser backend.
-pub(crate) type Caller<'a, T> = common::Caller<'a, T, Backend>;
+pub type Caller<'a, T> = common::Caller<'a, T, Backend>;
 /// Alias for [`common::Instance`] specialized for the browser backend.
 pub(crate) type Instance = common::Instance<Backend>;
 /// Alias for [`common::Linker`] specialized for the browser backend.
@@ -39,6 +39,9 @@ pub(crate) use super::common::{
     Extern, FuncType, Global, GlobalType, MemoryType, Mutability, Val, ValRaw,
     ValType,
 };
+
+pub(crate) type Trampoline<T> = common::Trampoline<T, Backend>;
+pub(crate) type TrampolineResult = common::TrampolineResult;
 
 struct GlobalInner {
     val_type: ValType,

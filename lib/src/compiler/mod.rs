@@ -38,7 +38,6 @@ use crate::compiler::errors::{
 };
 use crate::compiler::report::ReportBuilder;
 use crate::compiler::{CompileContext, VarStack};
-use crate::modules::BUILTIN_MODULES;
 use crate::re::hir::{ChainedPattern, ChainedPatternGap};
 use crate::string_pool::{BStringPool, StringPool};
 use crate::symbols::{StackedSymbolTable, Symbol, SymbolLookup, SymbolTable};
@@ -299,7 +298,7 @@ pub struct Compiler<'a> {
 
     /// Similar to `ident_pool` but for regular expressions found in rule
     /// conditions.
-    regexp_pool: StringPool<RegexpId>,
+    regex_pool: StringPool<RegexId>,
 
     /// Similar to `ident_pool` but for string literals found in the source
     /// code. As literal strings in YARA can contain arbitrary bytes, a pool
@@ -338,12 +337,29 @@ pub struct Compiler<'a> {
     /// `FilesizeBounds{start: Bound::Unbounded, end: Bound:Excluded(1000)}`.
     filesize_bounds: FxHashMap<PatternId, FilesizeBounds>,
 
+    /// Map that associates a `PatternId` to a certain constraint on the
+    /// file header (e.g. magic bytes at offset 0), if any.
+    ///
+    /// A condition like `uint16(0) == 0x5A4D and $a` or `$mz at 0 and $a`
+    /// (were $mz = "MZ") only matches if the file starts with "MZ" (0x5A4D).
+    /// In this case the map will contain an entry associating `$a` to a
+    /// `HeaderConstraint` that requires the file to start with those two
+    /// bytes.
+    ///
+    /// This allows skipping pattern checks entirely if the scanned data doesn't
+    /// start with the expected header prefix.
+    header_constraints: FxHashMap<PatternId, HeaderConstraint>,
+
     /// A vector with all the rules that has been compiled. A [`RuleId`] is
     /// an index in this vector.
     rules: Vec<RuleInfo>,
 
     /// Next (not used yet) [`PatternId`].
     next_pattern_id: PatternId,
+
+    /// Vector where the N-th boolean indicates whether the pattern with
+    /// PatternId = N is a fast-scan pattern.
+    fast_scan_patterns: bitvec::vec::BitVec,
 
     /// Map used for de-duplicating pattern. Keys are the pattern's IR and
     /// values are the `PatternId` assigned to each pattern. Every time a rule
@@ -416,6 +432,9 @@ pub struct Compiler<'a> {
     /// Linters applied to each rule during compilation. The linters are added
     /// to the compiler using [`Compiler::add_linter`]:
     linters: Vec<Box<dyn linters::Linter + 'a>>,
+
+    /// Grouped RegexSets constructed during IR creation for or-expressions.
+    pub(crate) regex_sets: FxHashMap<RegexSetId, Vec<RegexId>>,
 }
 
 impl<'a> Compiler<'a> {
@@ -481,6 +500,7 @@ impl<'a> Compiler<'a> {
             error_on_slow_pattern: false,
             error_on_slow_loop: false,
             next_pattern_id: PatternId(0),
+            fast_scan_patterns: bitvec::vec::BitVec::new(),
             current_namespace: default_namespace,
             features: FxHashSet::default(),
             warnings: Warnings::default(),
@@ -495,16 +515,18 @@ impl<'a> Compiler<'a> {
             banned_modules: FxHashMap::default(),
             ignored_rules: FxHashMap::default(),
             filesize_bounds: FxHashMap::default(),
+            header_constraints: FxHashMap::default(),
             root_struct: Struct::new().make_root(),
             report_builder: ReportBuilder::new(),
             lit_pool: BStringPool::new(),
-            regexp_pool: StringPool::new(),
+            regex_pool: StringPool::new(),
             patterns: FxHashMap::default(),
             ir_writer: None,
             linters: Vec::new(),
             include_dirs: None,
             includes_enabled: true,
             include_stack: Vec::new(),
+            regex_sets: FxHashMap::default(),
         }
     }
 
@@ -795,7 +817,7 @@ impl<'a> Compiler<'a> {
             ac: None,
             num_patterns: self.next_pattern_id.0 as usize,
             ident_pool: self.ident_pool,
-            regexp_pool: self.regexp_pool,
+            regex_pool: self.regex_pool,
             lit_pool: self.lit_pool,
             imported_modules: self.imported_modules,
             rules: self.rules,
@@ -805,6 +827,9 @@ impl<'a> Compiler<'a> {
             re_code: self.re_code,
             warnings: self.warnings.into(),
             filesize_bounds: self.filesize_bounds,
+            header_constraints: self.header_constraints,
+            regex_sets: self.regex_sets,
+            fast_scan_patterns: self.fast_scan_patterns,
         };
 
         rules.build_ac_automaton();
@@ -947,6 +972,14 @@ impl<'a> Compiler<'a> {
     /// Enables or disables all warnings.
     pub fn switch_all_warnings(&mut self, enabled: bool) -> &mut Self {
         self.warnings.switch_all_warnings(enabled);
+        self
+    }
+
+    /// Sets the maximum number of warnings.
+    ///
+    /// The compiler will report only the first `n` warnings.
+    pub fn max_warnings(&mut self, n: usize) -> &mut Self {
+        self.warnings.max_warnings = Some(n);
         self
     }
 
@@ -1178,6 +1211,7 @@ impl Compiler<'_> {
             re_code_len: self.re_code.len(),
             sub_patterns_len: self.sub_patterns.len(),
             symbol_table_len: self.symbol_table.len(),
+            fast_scan_patterns_len: self.fast_scan_patterns.len(),
         }
     }
 
@@ -1192,6 +1226,7 @@ impl Compiler<'_> {
         self.re_code.truncate(snapshot.re_code_len);
         self.atoms.truncate(snapshot.atoms_len);
         self.symbol_table.truncate(snapshot.symbol_table_len);
+        self.fast_scan_patterns.truncate(snapshot.fast_scan_patterns_len);
 
         // Pattern IDs that are >= next_pattern_id, are being discarded. Any pattern
         // or file size bound associated to such IDs must be removed.
@@ -1200,6 +1235,9 @@ impl Compiler<'_> {
             .retain(|_, pattern_id| *pattern_id < snapshot.next_pattern_id);
 
         self.filesize_bounds
+            .retain(|pattern_id, _| *pattern_id < snapshot.next_pattern_id);
+
+        self.header_constraints
             .retain(|pattern_id, _| *pattern_id < snapshot.next_pattern_id);
     }
 
@@ -1520,6 +1558,8 @@ impl Compiler<'_> {
             for_of_depth: 0,
             features: &self.features,
             loop_iteration_multiplier: 1,
+            regex_sets: &mut self.regex_sets,
+            regex_pool: &mut self.regex_pool,
         };
 
         // Convert the patterns from AST to IR. This populates the
@@ -1646,6 +1686,18 @@ impl Compiler<'_> {
         // `filesize`, if any.
         let filesize_bounds = self.ir.filesize_bounds();
 
+        // Analyze the condition and determine if it imposes some constraint
+        // to the file header (ex: `uint16(0) == 0x5a4d`).
+        let header_constraints = self.ir.header_constraints(|pat_idx| {
+            let pat = &rule_patterns[pat_idx.as_usize()];
+            match pat.pattern() {
+                Pattern::Text(lit) => Some(lit.text.as_bytes().to_vec()),
+                Pattern::Regexp(re) | Pattern::Hex(re) => {
+                    re.hir.as_literal_bytes().map(|bytes| bytes.to_vec())
+                }
+            }
+        });
+
         // Set the bounds to all patterns in the rule. This must be done
         // before assigning the PatternId to each pattern, as the filesize
         // bounds are taken into account when determining if the pattern
@@ -1653,6 +1705,15 @@ impl Compiler<'_> {
         if !filesize_bounds.unbounded() {
             for pattern in &mut rule_patterns {
                 pattern.pattern_mut().set_filesize_bounds(&filesize_bounds);
+            }
+        }
+
+        // Set header constraints to all patterns in the rule.
+        if !header_constraints.unconstrained() {
+            for pattern in &mut rule_patterns {
+                pattern
+                    .pattern_mut()
+                    .set_header_constraints(&header_constraints);
             }
         }
 
@@ -1702,11 +1763,16 @@ impl Compiler<'_> {
                     Entry::Vacant(entry) => {
                         let pattern_id = self.next_pattern_id;
                         self.next_pattern_id.incr(1);
+                        self.fast_scan_patterns.push(true);
                         pending_patterns.insert(pattern_id);
                         entry.insert(pattern_id);
                         pattern_id
                     }
                 };
+
+            if !pattern.fast_scan_allowed() {
+                self.fast_scan_patterns.set(usize::from(pattern_id), false);
+            }
 
             let kind = match pattern.pattern() {
                 Pattern::Text(_) => PatternKind::Text,
@@ -1783,6 +1849,17 @@ impl Compiler<'_> {
                         "modifying the file size bounds of an existing pattern"
                     )
                 }
+                if !header_constraints.unconstrained()
+                    && self
+                        .header_constraints
+                        .insert(*pattern_id, header_constraints.clone())
+                        .is_some()
+                {
+                    // This should not happen.
+                    panic!(
+                        "modifying the header constraints of an existing pattern"
+                    )
+                }
                 pending_patterns.remove(pattern_id);
             }
         }
@@ -1815,7 +1892,7 @@ impl Compiler<'_> {
         let mut ctx = EmitContext {
             current_rule: self.rules.last_mut().unwrap(),
             lit_pool: &mut self.lit_pool,
-            regexp_pool: &mut self.regexp_pool,
+            regex_pool: &mut self.regex_pool,
             wasm_symbols: &self.wasm_symbols,
             wasm_exports: &self.wasm_exports,
             exception_handler_stack: Vec::new(),
@@ -1836,7 +1913,8 @@ impl Compiler<'_> {
 
     fn c_import(&mut self, import: &Import) -> Result<(), CompileError> {
         let module_name = import.module_name;
-        let module = BUILTIN_MODULES.get(module_name);
+        let module = crate::modules::registered_modules()
+            .find(|m| m.name() == module_name);
 
         // Does a module with the given name actually exist? ...
         if module.is_none() {
@@ -2612,7 +2690,7 @@ impl From<IdentId> for u32 {
 /// ID associated to each literal string in the literals pool.
 #[derive(PartialEq, Debug, Copy, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
-pub(crate) struct LiteralId(u32);
+pub struct LiteralId(u32);
 
 impl From<i32> for LiteralId {
     fn from(v: i32) -> Self {
@@ -2648,6 +2726,13 @@ impl From<LiteralId> for u64 {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct NamespaceId(i32);
+
+impl From<i32> for NamespaceId {
+    #[inline]
+    fn from(v: i32) -> Self {
+        Self(v)
+    }
+}
 
 /// ID associated to each rule.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
@@ -2692,48 +2777,81 @@ impl From<RuleId> for i32 {
 }
 
 /// ID associated to each regexp used in a rule condition.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct RegexpId(i32);
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub(crate) struct RegexId(i32);
 
-impl From<i32> for RegexpId {
+impl From<i32> for RegexId {
     #[inline]
     fn from(value: i32) -> Self {
         Self(value)
     }
 }
 
-impl From<u32> for RegexpId {
+impl From<u32> for RegexId {
     #[inline]
     fn from(value: u32) -> Self {
         Self(value.try_into().unwrap())
     }
 }
 
-impl From<i64> for RegexpId {
+impl From<i64> for RegexId {
     #[inline]
     fn from(value: i64) -> Self {
         Self(value.try_into().unwrap())
     }
 }
 
-impl From<RegexpId> for usize {
+impl From<RegexId> for usize {
     #[inline]
-    fn from(value: RegexpId) -> Self {
+    fn from(value: RegexId) -> Self {
         value.0 as usize
     }
 }
 
-impl From<RegexpId> for i32 {
+impl From<RegexId> for i32 {
     #[inline]
-    fn from(value: RegexpId) -> Self {
+    fn from(value: RegexId) -> Self {
         value.0
     }
 }
 
-impl From<RegexpId> for u32 {
+impl From<RegexId> for u32 {
     #[inline]
-    fn from(value: RegexpId) -> Self {
+    fn from(value: RegexId) -> Self {
         value.0.try_into().unwrap()
+    }
+}
+
+/// ID associated to each grouped `RegexSet`.
+///
+/// When compiling multiple rules, identical string expressions (such as a
+/// specific field access like `vt.net.domain.raw`) are frequently matched
+/// against multiple distinct regular expressions. To optimize these
+/// evaluations, the compiler identifies identical targets, assigns them a
+/// unique `RegexSetId`, and groups all their associated regular expressions
+/// together. At runtime, the entire set is evaluated simultaneously in a
+/// single pass.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub(crate) struct RegexSetId(i32);
+
+impl From<i32> for RegexSetId {
+    #[inline]
+    fn from(value: i32) -> Self {
+        Self(value)
+    }
+}
+
+impl From<RegexSetId> for usize {
+    #[inline]
+    fn from(value: RegexSetId) -> Self {
+        value.0 as usize
+    }
+}
+
+impl From<RegexSetId> for i32 {
+    #[inline]
+    fn from(value: RegexSetId) -> Self {
+        value.0
     }
 }
 
@@ -2939,6 +3057,7 @@ struct Snapshot {
     re_code_len: usize,
     sub_patterns_len: usize,
     symbol_table_len: usize,
+    fast_scan_patterns_len: usize,
 }
 
 /// Represents a list of warnings.
@@ -2946,27 +3065,18 @@ struct Snapshot {
 /// This is a wrapper around a `Vec<Warning>` that contains additional logic
 /// for limiting the number of warnings stored in the vector and silencing some
 /// warnings types.
+#[derive(Default)]
 pub(crate) struct Warnings {
     warnings: Vec<Warning>,
-    /// Maximum number of warnings that will be stored in `warnings`.
-    max_warnings: usize,
+    /// Maximum number of warnings that will be stored in `warnings`. If this
+    /// is `None`, there will no limits.
+    max_warnings: Option<usize>,
     /// Warnings that are globally disabled.
     disabled_warnings: HashSet<String>,
     /// Warnings that are suppressed for a specific code span. Keys are
     /// warning identifiers, and values are the code spans in which the
     /// warning is disabled.
     suppressed_warnings: HashMap<String, Vec<Span>>,
-}
-
-impl Default for Warnings {
-    fn default() -> Self {
-        Self {
-            warnings: Vec::new(),
-            max_warnings: 100,
-            disabled_warnings: HashSet::default(),
-            suppressed_warnings: HashMap::default(),
-        }
-    }
 }
 
 impl Warnings {
@@ -2976,7 +3086,7 @@ impl Warnings {
     /// added.
     #[inline]
     pub fn add(&mut self, f: impl FnOnce() -> Warning) {
-        if self.warnings.len() < self.max_warnings {
+        if self.warnings.len() < self.max_warnings.unwrap_or(usize::MAX) {
             let warning = f();
             let mut warn = !self.disabled_warnings.contains(warning.code());
 
