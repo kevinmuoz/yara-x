@@ -5,7 +5,6 @@ module implements the YARA compiler.
 */
 
 use std::cell::RefCell;
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -814,7 +813,7 @@ impl<'a> Compiler<'a> {
             wasm_mod,
             compiled_wasm_mod: Some(compiled_wasm_mod),
             relaxed_re_syntax: self.relaxed_re_syntax,
-            ac: None,
+            ac: AhoCorasick::default(),
             num_patterns: self.next_pattern_id.0 as usize,
             ident_pool: self.ident_pool,
             regex_pool: self.regex_pool,
@@ -1757,27 +1756,24 @@ impl Compiler<'_> {
                 num_private_patterns += 1;
             }
 
-            // Check if this pattern has been declared before, in this rule or
-            // in some other rule. In such cases the pattern ID is re-used, and
-            // we don't need to process (i.e: extract atoms and add them to
-            // Aho-Corasick automaton) the pattern again. Two patterns are
-            // considered equal if they are exactly the same, including any
-            // modifiers associated to the pattern, both are non-anchored
-            // or anchored at the same file offset, and if they have the same
-            // file size bounds.
             let pattern_id =
-                match self.patterns.entry(pattern.pattern().clone()) {
-                    // The pattern already exists, return the existing ID.
-                    Entry::Occupied(entry) => *entry.get(),
-                    // The pattern didn't exist.
-                    Entry::Vacant(entry) => {
-                        let pattern_id = self.next_pattern_id;
-                        self.next_pattern_id.incr(1);
-                        self.fast_scan_patterns.push(true);
-                        pending_patterns.insert(pattern_id);
-                        entry.insert(pattern_id);
-                        pattern_id
-                    }
+                // Check if this pattern has been declared before, in this rule or
+                // in some other rule. In such cases the pattern ID is re-used, and
+                // we don't need to process (i.e: extract atoms and add them to
+                // Aho-Corasick automaton) the pattern again. Two patterns are
+                // considered equal if they are exactly the same, including any
+                // modifiers associated to the pattern, both are non-anchored
+                // or anchored at the same file offset, and if they have the same
+                // file size bounds.
+                if let Some(pattern_id) = self.patterns.get(pattern.pattern()) {
+                    *pattern_id
+                } else {
+                    let pattern_id = self.next_pattern_id;
+                    self.next_pattern_id.incr(1);
+                    self.fast_scan_patterns.push(true);
+                    pending_patterns.insert(pattern_id);
+                    self.patterns.insert(pattern.pattern().clone(), pattern_id);
+                    pattern_id
                 };
 
             if !pattern.fast_scan_allowed() {
@@ -2026,7 +2022,10 @@ impl Compiler<'_> {
         let mut main_patterns = Vec::new();
         let wide_pattern;
 
-        if pattern.flags.contains(PatternFlags::Wide) {
+        if pattern
+            .flags
+            .intersects(PatternFlags::WideOnly | PatternFlags::WideAndAscii)
+        {
             wide_pattern = make_wide(pattern.text.as_bytes());
             main_patterns.push((
                 wide_pattern.as_slice(),
@@ -2035,7 +2034,7 @@ impl Compiler<'_> {
             ));
         }
 
-        if pattern.flags.contains(PatternFlags::Ascii) {
+        if !pattern.flags.contains(PatternFlags::WideOnly) {
             main_patterns.push((
                 pattern.text.as_bytes(),
                 best_atom_in_bytes(pattern.text.as_bytes()),
@@ -2251,7 +2250,9 @@ impl Compiler<'_> {
         // `{ 1? 2? 3? }`), we can treat it as a `LiteralWithMask` sub-pattern.
         // This is much more efficient than executing it as a regular expression.
         if !pattern.flags.contains(PatternFlags::Nocase)
-            && !pattern.flags.contains(PatternFlags::Wide)
+            && !pattern.flags.intersects(
+                PatternFlags::WideOnly | PatternFlags::WideAndAscii,
+            )
             && let Some((pattern, mask, atoms)) =
                 head.try_extract_literal_with_mask()
         {
@@ -2272,7 +2273,10 @@ impl Compiler<'_> {
             flags.insert(SubPatternFlags::FastRegexp);
         }
 
-        if pattern.flags.contains(PatternFlags::Wide) {
+        if pattern
+            .flags
+            .intersects(PatternFlags::WideOnly | PatternFlags::WideAndAscii)
+        {
             self.add_sub_pattern(
                 pattern_id,
                 SubPattern::Regexp { flags: flags | SubPatternFlags::Wide },
@@ -2281,7 +2285,7 @@ impl Compiler<'_> {
             );
         }
 
-        if pattern.flags.contains(PatternFlags::Ascii) {
+        if !pattern.flags.contains(PatternFlags::WideOnly) {
             self.add_sub_pattern(
                 pattern_id,
                 SubPattern::Regexp { flags },
@@ -2300,8 +2304,9 @@ impl Compiler<'_> {
         anchored_at: Option<usize>,
         flags: PatternFlags,
     ) -> Result<(), CompileError> {
-        let ascii = flags.contains(PatternFlags::Ascii);
-        let wide = flags.contains(PatternFlags::Wide);
+        let raw = !flags.contains(PatternFlags::WideOnly);
+        let wide = flags
+            .intersects(PatternFlags::WideOnly | PatternFlags::WideAndAscii);
         let case_insensitive = flags.contains(PatternFlags::Nocase);
         let full_word = flags.contains(PatternFlags::Fullword);
 
@@ -2361,7 +2366,7 @@ impl Compiler<'_> {
 
         match hir.kind() {
             hir::HirKind::Literal(literal) => {
-                if ascii {
+                if raw {
                     process_literal(literal, false);
                 }
                 if wide {
@@ -2373,7 +2378,7 @@ impl Compiler<'_> {
                     .iter()
                     .map(|l| cast!(l.kind(), hir::HirKind::Literal));
                 for literal in literals {
-                    if ascii {
+                    if raw {
                         process_literal(literal, false);
                     }
                     if wide {
@@ -2395,8 +2400,9 @@ impl Compiler<'_> {
         flags: PatternFlags,
         span: Span,
     ) -> Result<(), CompileError> {
-        let ascii = flags.contains(PatternFlags::Ascii);
-        let wide = flags.contains(PatternFlags::Wide);
+        let raw = !flags.contains(PatternFlags::WideOnly);
+        let wide = flags
+            .intersects(PatternFlags::WideOnly | PatternFlags::WideAndAscii);
         let case_insensitive = flags.contains(PatternFlags::Nocase);
         let full_word = flags.contains(PatternFlags::Fullword);
 
@@ -2410,7 +2416,7 @@ impl Compiler<'_> {
             common_flags.insert(SubPatternFlags::GreedyRegexp);
         }
 
-        let mut prev_sub_pattern_ascii = SubPatternId(0);
+        let mut prev_sub_pattern_raw = SubPatternId(0);
         let mut prev_sub_pattern_wide = SubPatternId(0);
 
         if let hir::HirKind::Literal(literal) = leading.kind() {
@@ -2420,8 +2426,8 @@ impl Compiler<'_> {
                 flags.insert(SubPatternFlags::FullwordLeft);
             }
 
-            if ascii {
-                prev_sub_pattern_ascii =
+            if raw {
+                prev_sub_pattern_raw =
                     self.c_literal_chain_head(pattern_id, literal, flags);
             }
 
@@ -2457,8 +2463,8 @@ impl Compiler<'_> {
                 );
             }
 
-            if ascii {
-                prev_sub_pattern_ascii = self.add_sub_pattern(
+            if raw {
+                prev_sub_pattern_raw = self.add_sub_pattern(
                     pattern_id,
                     SubPattern::RegexpChainHead { flags },
                     atoms.into_iter(),
@@ -2491,11 +2497,11 @@ impl Compiler<'_> {
                         flags | SubPatternFlags::Wide,
                     );
                 };
-                if ascii {
-                    prev_sub_pattern_ascii = self.c_literal_chain_tail(
+                if raw {
+                    prev_sub_pattern_raw = self.c_literal_chain_tail(
                         pattern_id,
                         literal,
-                        prev_sub_pattern_ascii,
+                        prev_sub_pattern_raw,
                         p.gap.clone(),
                         flags,
                     );
@@ -2525,11 +2531,11 @@ impl Compiler<'_> {
                     )
                 }
 
-                if ascii {
-                    prev_sub_pattern_ascii = self.add_sub_pattern(
+                if raw {
+                    prev_sub_pattern_raw = self.add_sub_pattern(
                         pattern_id,
                         SubPattern::RegexpChainTail {
-                            chained_to: prev_sub_pattern_ascii,
+                            chained_to: prev_sub_pattern_raw,
                             gap: p.gap.clone(),
                             flags,
                         },

@@ -6,7 +6,8 @@ https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-ovba/575462ba
 */
 
 use crate::modules::vba::parser::decompress_stream;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
+use std::borrow::Cow;
 
 use crate::mods::prelude::*;
 use crate::modules::olecf::parser::OLECFParser;
@@ -26,9 +27,9 @@ impl<'a> VbaExtractor<'a> {
     }
 
     fn read_stream_data(
-        ole_parser: &OLECFParser,
+        ole_parser: &OLECFParser<'a>,
         name: &str,
-    ) -> Result<Vec<u8>, &'static str> {
+    ) -> Result<Cow<'a, [u8]>, &'static str> {
         let size = ole_parser.get_stream_size(name)? as usize;
         if size == 0 {
             return Err("Stream is empty");
@@ -36,16 +37,16 @@ impl<'a> VbaExtractor<'a> {
         ole_parser.get_stream_data(name)
     }
 
-    fn extract_from_ole_bytes(ole_data: &[u8]) -> Result<Vba, &'static str> {
+    fn extract_from_ole_bytes(ole_data: &'a [u8]) -> Result<Vba, &'static str> {
         let ole_parser = OLECFParser::new(ole_data)?;
         let stream_names = ole_parser.get_stream_names()?;
 
         let mut vba_dir = None;
-        let mut modules = HashMap::new();
+        let mut modules = HashMap::default();
 
         // First process the dir stream
         if let Some(dir_name) =
-            stream_names.iter().find(|n| n.to_lowercase().trim() == "dir")
+            stream_names.iter().find(|n| n.trim().eq_ignore_ascii_case("dir"))
             && let Ok(data) = Self::read_stream_data(&ole_parser, dir_name)
         {
             vba_dir = Some(data);
@@ -53,12 +54,11 @@ impl<'a> VbaExtractor<'a> {
 
         // Then process other streams
         for name in &stream_names {
-            let lowercase_name = name.to_lowercase();
-
-            if lowercase_name != "dir"
+            if !name.trim().eq_ignore_ascii_case("dir")
                 && let Ok(data) = Self::read_stream_data(&ole_parser, name)
                 && !data.is_empty()
             {
+                let lowercase_name = name.to_lowercase();
                 modules.insert(parser::normalize_name(&lowercase_name), data);
             }
         }
