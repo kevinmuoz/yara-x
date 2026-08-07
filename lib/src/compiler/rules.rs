@@ -1,3 +1,4 @@
+use std::collections::hash_map;
 use std::fmt;
 use std::io::{BufWriter, Read, Write};
 use std::ops::{Bound, RangeBounds};
@@ -322,6 +323,8 @@ impl Rules {
             });
         }
 
+        crate::init_logger();
+
         #[cfg(feature = "logging")]
         let start = Instant::now();
 
@@ -474,20 +477,11 @@ impl Rules {
         let parser = re::parser::Parser::new()
             .relaxed_re_syntax(self.relaxed_re_syntax);
 
-        let hir = parser.parse(&re).unwrap().into_inner();
+        let hir = parser.parse(&re).unwrap();
 
-        // Set a size limit for the NFA automata. The default limit (10MB) is
-        // too small for certain regexps seen in YARA rules in the wild, see:
-        // https://github.com/VirusTotal/yara-x/issues/85
-        let config = regex_automata::meta::Config::new()
-            .nfa_size_limit(Some(50 * 1024 * 1024));
-
-        regex_automata::meta::Builder::new()
-            .configure(config)
-            .build_from_hir(&hir)
-            .unwrap_or_else(|err| {
-                panic!("error compiling regex `{}`: {:#?}", re.as_str(), err)
-            })
+        hir.build_automata().unwrap_or_else(|err| {
+            panic!("error compiling regex `{}`: {:#?}", re.as_str(), err)
+        })
     }
 
     /// Returns a compiled multi-pattern `RegexSet` for a given `RegexSetId`.
@@ -534,13 +528,21 @@ impl Rules {
     pub(crate) fn get_rule_and_pattern_by_sub_pattern_id(
         &self,
         sub_pattern_id: SubPatternId,
-    ) -> Option<(RuleId, IdentId)> {
-        let (target_pattern_id, _) = self.get_sub_pattern(sub_pattern_id);
-        for (rule_id, rule) in self.rules.iter().enumerate() {
+    ) -> Option<(&RuleInfo, &PatternInfo)> {
+        let (pattern_id, _) = self.get_sub_pattern(sub_pattern_id);
+        self.get_rule_and_pattern_by_pattern_id(*pattern_id)
+    }
+
+    #[cfg(feature = "logging")]
+    pub(crate) fn get_rule_and_pattern_by_pattern_id(
+        &self,
+        pattern_id: PatternId,
+    ) -> Option<(&RuleInfo, &PatternInfo)> {
+        for rule in &self.rules {
             for p in &rule.patterns {
-                if p.pattern_id == *target_pattern_id {
-                    return Some((rule_id.into(), p.ident_id));
-                };
+                if p.pattern_id == pattern_id {
+                    return Some((rule, p));
+                }
             }
         }
         None
@@ -599,15 +601,13 @@ impl Rules {
             }
 
             if x.atom.len() < 2 {
-                let (rule_id, pattern_ident_id) = self
+                let (rule, pattern) = self
                     .get_rule_and_pattern_by_sub_pattern_id(x.sub_pattern_id)
                     .unwrap();
 
-                let rule = self.get(rule_id);
-
-                info!(
+                warn!(
                     "Very short atom in pattern `{}` in rule `{}:{}` (length: {})",
-                    self.ident_pool.get(pattern_ident_id).unwrap(),
+                    self.ident_pool.get(pattern.ident_id).unwrap(),
                     self.ident_pool.get(rule.namespace_ident_id).unwrap(),
                     self.ident_pool.get(rule.ident_id).unwrap(),
                     x.atom.len()
@@ -669,17 +669,15 @@ impl Rules {
     #[inline]
     pub(crate) fn filesize_bounds(
         &self,
-        pattern_id: PatternId,
-    ) -> Option<&FilesizeBounds> {
-        self.filesize_bounds.get(&pattern_id)
+    ) -> hash_map::Iter<'_, PatternId, FilesizeBounds> {
+        self.filesize_bounds.iter()
     }
 
     #[inline]
     pub(crate) fn header_constraints(
         &self,
-        pattern_id: PatternId,
-    ) -> Option<&HeaderConstraint> {
-        self.header_constraints.get(&pattern_id)
+    ) -> hash_map::Iter<'_, PatternId, HeaderConstraint> {
+        self.header_constraints.iter()
     }
 
     #[inline]

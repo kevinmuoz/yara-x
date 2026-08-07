@@ -10,14 +10,25 @@ import "../components/yara-status-bar";
 import { PlaygroundEditorController } from "../controllers/playground-editor-controller";
 import { PlaygroundSessionController } from "../controllers/playground-session-controller";
 import { SplitResizeController } from "../controllers/split-resize-controller";
-import { updateYaraConfig } from "../editor/yara-monaco";
+import { setMonacoTheme, updateYaraConfig } from "../editor/yara-monaco";
 import {
   loadStoredPlaygroundSettings,
+  loadStoredPlaygroundTheme,
+  PLAYGROUND_THEME_STORAGE_KEY,
   storePlaygroundSettings,
+  storePlaygroundTheme,
+  type PlaygroundTheme,
 } from "../persistence/playground-settings-storage";
-import type { ExecutionState, ResultMode } from "../results/result-types";
+import type {
+  ExecutionState,
+  MatchRange,
+  ResultMode,
+} from "../results/result-types";
 import { summarizeResult } from "../results/summarize-result";
-import { createSampleHighlights } from "../sample/sample-highlights";
+import {
+  createSampleHighlights,
+  mapSampleByteRangeToEditorRange,
+} from "../sample/sample-highlights";
 import type { LoadedSampleFile } from "../sample/sample-file";
 import { isInlineSampleMode, type SampleMode } from "../sample/sample-modes";
 import {
@@ -98,7 +109,16 @@ export class YaraPlaygroundApp extends LitElement {
   private languageServerVersion: string | null = null;
 
   @state()
+  private theme: PlaygroundTheme = "dark";
+
+  @state()
   private settings = createDefaultPlaygroundSettings();
+
+  @state()
+  private canNavigateMatches = false;
+
+  @state()
+  private activeMatchRange: MatchRange | null = null;
 
   private scanService?: ScanService;
   private sampleEditorLayoutFrameId?: number;
@@ -110,6 +130,7 @@ export class YaraPlaygroundApp extends LitElement {
     {
       onSampleChange: () => {
         this.clearSampleHighlights();
+        this.invalidateMatchNavigation();
       },
     },
   );
@@ -120,6 +141,12 @@ export class YaraPlaygroundApp extends LitElement {
     },
     onStatus: (status) => {
       this.lspStatus = status;
+    },
+    onFormatRequest: () => {
+      void this.formatRule();
+    },
+    onRunRequest: () => {
+      void this.runScan();
     },
   });
 
@@ -163,6 +190,10 @@ export class YaraPlaygroundApp extends LitElement {
       }
     }
 
+    if (event.defaultPrevented) {
+      return;
+    }
+
     if (
       (event.metaKey || event.ctrlKey) &&
       !event.shiftKey &&
@@ -189,12 +220,47 @@ export class YaraPlaygroundApp extends LitElement {
     }
   };
 
+  private readonly handleSystemThemeChange = (event: MediaQueryListEvent) => {
+    try {
+      const stored = localStorage.getItem(PLAYGROUND_THEME_STORAGE_KEY);
+      if (!stored) {
+        this.applyTheme(event.matches ? "light" : "dark");
+      }
+    } catch {}
+  };
+
+  private applyTheme(theme: PlaygroundTheme) {
+    this.theme = theme;
+    document.documentElement.setAttribute("data-theme", theme);
+    document.documentElement.setAttribute("data-bs-theme", theme);
+    document.documentElement.style.colorScheme = theme;
+    setMonacoTheme(theme);
+    storePlaygroundTheme(theme);
+  }
+
+  private handleThemeToggle = () => {
+    const nextTheme: PlaygroundTheme = this.theme === "dark" ? "light" : "dark";
+    this.applyTheme(nextTheme);
+  };
+
+  private handleThemeChange = (event: CustomEvent<PlaygroundTheme>) => {
+    this.applyTheme(event.detail);
+  };
+
   connectedCallback() {
     super.connectedCallback();
     this.sampleMode = this.sessionController.inlineSampleMode;
     this.settings = loadStoredPlaygroundSettings();
     updateYaraConfig(toYaraConfig(this.settings));
+    this.theme = loadStoredPlaygroundTheme();
+    this.applyTheme(this.theme);
     window.addEventListener("keydown", this.handleKeydown);
+
+    if (typeof window !== "undefined" && window.matchMedia) {
+      window
+        .matchMedia("(prefers-color-scheme: light)")
+        .addEventListener("change", this.handleSystemThemeChange);
+    }
   }
 
   protected async firstUpdated() {
@@ -236,6 +302,11 @@ export class YaraPlaygroundApp extends LitElement {
 
   disconnectedCallback() {
     window.removeEventListener("keydown", this.handleKeydown);
+    if (typeof window !== "undefined" && window.matchMedia) {
+      window
+        .matchMedia("(prefers-color-scheme: light)")
+        .removeEventListener("change", this.handleSystemThemeChange);
+    }
     if (this.sampleEditorLayoutFrameId != null) {
       window.cancelAnimationFrame(this.sampleEditorLayoutFrameId);
     }
@@ -280,8 +351,26 @@ export class YaraPlaygroundApp extends LitElement {
     }
 
     this.editorController.sample.setHighlights(
-      createSampleHighlights(raw, mode, source),
+      createSampleHighlights(raw, mode, source, this.activeMatchRange),
     );
+  }
+
+  private refreshCurrentSampleHighlights() {
+    if (!isInlineSampleMode(this.sampleMode)) {
+      return;
+    }
+
+    const source = this.editorController.sample?.getValue();
+    if (!source) {
+      return;
+    }
+
+    this.syncSampleHighlights(this.execution.raw, this.sampleMode, source);
+  }
+
+  private invalidateMatchNavigation() {
+    this.activeMatchRange = null;
+    this.canNavigateMatches = false;
   }
 
   private scheduleSampleEditorLayout() {
@@ -384,15 +473,21 @@ export class YaraPlaygroundApp extends LitElement {
       this.editorController.sample?.getValue() !== input.sample.source
     ) {
       this.clearSampleHighlights();
-      return;
+      return false;
     }
 
     this.syncSampleHighlights(raw, input.sample.mode, input.sample.source);
+    return true;
   }
 
   private async runScan() {
     if (!this.canRun) return;
 
+    const hadActiveMatchRange = this.activeMatchRange !== null;
+    this.invalidateMatchNavigation();
+    if (hadActiveMatchRange) {
+      this.refreshCurrentSampleHighlights();
+    }
     this.scanStage = "preparing";
     const startedAt = performance.now();
 
@@ -407,7 +502,10 @@ export class YaraPlaygroundApp extends LitElement {
         startedAt,
         finishedAt,
       );
-      this.syncScanHighlights(scanResponse.raw, input);
+      this.canNavigateMatches = this.syncScanHighlights(
+        scanResponse.raw,
+        input,
+      );
     } catch (error) {
       if (error instanceof ScanCancelledError) {
         const raw = { cancelled: true };
@@ -418,6 +516,7 @@ export class YaraPlaygroundApp extends LitElement {
           Math.round(performance.now() - startedAt),
         );
         this.clearSampleHighlights();
+        this.invalidateMatchNavigation();
         return;
       }
 
@@ -432,6 +531,7 @@ export class YaraPlaygroundApp extends LitElement {
 
       await this.publishScanExecution(raw, [], startedAt, finishedAt);
       this.clearSampleHighlights();
+      this.invalidateMatchNavigation();
     } finally {
       this.scanStage = "idle";
     }
@@ -466,6 +566,7 @@ export class YaraPlaygroundApp extends LitElement {
     }
 
     this.clearSampleHighlights();
+    this.invalidateMatchNavigation();
   };
 
   private handleSampleFileLoad = (event: CustomEvent<LoadedSampleFile>) => {
@@ -473,6 +574,7 @@ export class YaraPlaygroundApp extends LitElement {
     this.loadedSampleFile = event.detail;
     this.sampleMode = "file";
     this.clearSampleHighlights();
+    this.invalidateMatchNavigation();
   };
 
   private handleSampleFileClear = () => {
@@ -482,10 +584,47 @@ export class YaraPlaygroundApp extends LitElement {
     this.sampleMode = inlineSampleMode;
     this.sessionController.restoreActiveSampleDraft();
     this.clearSampleHighlights();
+    this.invalidateMatchNavigation();
   };
 
   private handleResultModeChange = (event: CustomEvent<ResultMode>) => {
     this.resultMode = event.detail;
+  };
+
+  private handleMatchRangeRequest = (event: CustomEvent<MatchRange>) => {
+    if (
+      !this.canNavigateMatches ||
+      (this.sampleMode !== "text" && this.sampleMode !== "hex")
+    ) {
+      return;
+    }
+
+    const source = this.editorController.sample?.getValue();
+    if (!source) {
+      return;
+    }
+
+    const isActiveRange =
+      this.activeMatchRange?.start === event.detail.start &&
+      this.activeMatchRange.end === event.detail.end;
+
+    if (isActiveRange) {
+      this.activeMatchRange = null;
+      this.syncSampleHighlights(this.execution.raw, this.sampleMode, source);
+      return;
+    }
+
+    const range = mapSampleByteRangeToEditorRange(
+      this.sampleMode,
+      source,
+      event.detail,
+    );
+
+    if (range) {
+      this.activeMatchRange = event.detail;
+      this.syncSampleHighlights(this.execution.raw, this.sampleMode, source);
+      this.editorController.sample?.revealRange(range.start, range.end);
+    }
   };
 
   private handleSettingsRequest = () => {
@@ -542,8 +681,10 @@ export class YaraPlaygroundApp extends LitElement {
     return html`
       <main class="studio">
         <yara-status-bar
+          .theme=${this.theme}
           .isBusy=${this.isBusy}
           .canRun=${this.canRun}
+          @theme-toggle=${this.handleThemeToggle}
           @run-request=${this.handleRunRequest}
           @cancel-request=${this.handleCancelRequest}
           @help-request=${this.handleHelpRequest}
@@ -602,13 +743,18 @@ export class YaraPlaygroundApp extends LitElement {
           <yara-result-panel
             .resultMode=${this.resultMode}
             .execution=${this.execution}
+            .canNavigateMatches=${this.canNavigateMatches}
+            .activeMatchRange=${this.activeMatchRange}
             @result-mode-change=${this.handleResultModeChange}
+            @match-range-request=${this.handleMatchRangeRequest}
           ></yara-result-panel>
         </section>
 
         <yara-settings-dialog
           .open=${this.settingsModalOpen}
+          .theme=${this.theme}
           .settings=${this.settings}
+          @theme-change=${this.handleThemeChange}
           @settings-close=${this.handleSettingsClose}
           @settings-apply=${this.handleSettingsApply}
         ></yara-settings-dialog>

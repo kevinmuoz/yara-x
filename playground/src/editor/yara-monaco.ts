@@ -19,7 +19,10 @@ import { createLanguageServerWorker } from "../language-server/language-server-w
 
 const RULE_URI = monaco.Uri.file("/workspace/main.yar");
 const SAMPLE_URI = monaco.Uri.file("/workspace/sample.txt");
-const THEME_NAME = "yara-studio";
+export const THEME_DARK = "yara-studio-dark";
+export const THEME_LIGHT = "yara-studio-light";
+
+let activeTheme: "dark" | "light" = "dark";
 
 export const YARA_CONFIG: YaraConfig = createDefaultYaraConfig();
 
@@ -30,6 +33,21 @@ export function updateYaraConfig(nextConfig: YaraConfig) {
   );
   YARA_CONFIG.ruleNameValidation = nextConfig.ruleNameValidation;
   YARA_CONFIG.cacheWorkspace = nextConfig.cacheWorkspace;
+}
+
+export function setMonacoTheme(theme: "dark" | "light") {
+  activeTheme = theme;
+  if (themesRegistered) {
+    try {
+      monaco.editor.setTheme(theme === "light" ? THEME_LIGHT : THEME_DARK);
+    } catch (e) {
+      console.warn("Failed to set Monaco theme", e);
+    }
+  }
+}
+
+export function getActiveMonacoTheme(): "dark" | "light" {
+  return activeTheme;
 }
 
 const YARA_KEYWORDS = [
@@ -77,24 +95,31 @@ export type EditorHandle = {
   layout: () => void;
   setHighlights: (highlights: EditorHighlight[]) => void;
   clearHighlights: () => void;
+  revealRange: (start: number, end: number) => boolean;
   onDidChangeValue: (listener: () => void) => { dispose: () => void };
   format: () => Promise<boolean>;
   dispose: () => void;
+};
+
+export type EditorActionHandlers = {
+  onFormatRequest?: () => void;
+  onRunRequest?: () => void;
 };
 
 export type EditorHighlight = {
   start: number;
   end: number;
   hoverMessage?: string;
+  isActive?: boolean;
 };
 
 let vscodeApiInitPromise: Promise<void> | undefined;
-let themeRegistered = false;
+let themesRegistered = false;
 
-function registerStudioTheme() {
-  if (themeRegistered) return;
+function registerStudioThemes() {
+  if (themesRegistered) return;
 
-  monaco.editor.defineTheme(THEME_NAME, {
+  monaco.editor.defineTheme(THEME_DARK, {
     base: "vs-dark",
     inherit: true,
     rules: [
@@ -121,7 +146,34 @@ function registerStudioTheme() {
     },
   });
 
-  themeRegistered = true;
+  monaco.editor.defineTheme(THEME_LIGHT, {
+    base: "vs",
+    inherit: true,
+    rules: [
+      { token: "keyword", foreground: "5d2f86" },
+      { token: "variable", foreground: "0284c7" },
+      { token: "identifier", foreground: "1d2d35" },
+      { token: "string", foreground: "16a34a" },
+      { token: "number", foreground: "d97706" },
+      { token: "comment", foreground: "64748b" },
+    ],
+    colors: {
+      "editor.background": "#ffffff",
+      "editor.lineHighlightBackground": "#f8fafc",
+      "editor.foreground": "#1d2d35",
+      "editorCursor.foreground": "#7296ef",
+      "editorLineNumber.foreground": "#94a3b8",
+      "editorLineNumber.activeForeground": "#334155",
+      "editor.selectionBackground": "#dbeafe",
+      "editor.inactiveSelectionBackground": "#f1f5f9",
+      "editorIndentGuide.background1": "#e2e8f0",
+      "editorIndentGuide.activeBackground1": "#94a3b8",
+      "editorWidget.background": "#ffffff",
+      "editorWidget.border": "#cbd5e1",
+    },
+  });
+
+  themesRegistered = true;
 }
 
 async function ensureVscodeApi() {
@@ -142,8 +194,8 @@ async function ensureVscodeApi() {
     });
 
     await apiWrapper.start();
-    registerStudioTheme();
-    monaco.editor.setTheme(THEME_NAME);
+    registerStudioThemes();
+    monaco.editor.setTheme(activeTheme === "light" ? THEME_LIGHT : THEME_DARK);
   })();
 
   await vscodeApiInitPromise;
@@ -237,6 +289,10 @@ async function createEditorModel(
 
   monaco.editor.setModelLanguage(model, language);
 
+  if (initialValue != null && model.getValue() !== initialValue) {
+    model.setValue(initialValue);
+  }
+
   return {
     model,
     modelRef,
@@ -272,21 +328,25 @@ async function createYaraLanguageClient() {
   return {
     languageServerVersion: client.initializeResult?.serverInfo?.version ?? null,
     dispose: () => {
-      void client.stop().catch((error) => {
-        console.error("failed to stop yara-x language client", error);
-      });
-      worker.terminate();
+      void client
+        .stop()
+        .catch((error) => {
+          console.error("failed to stop yara-x language client", error);
+        })
+        .finally(() => {
+          worker.terminate();
+        });
     },
   };
 }
 
 function buildEditor(
   element: HTMLElement,
-  model: unknown,
+  model: monaco.editor.ITextModel,
   options: monaco.editor.IStandaloneEditorConstructionOptions,
 ): monaco.editor.IStandaloneCodeEditor {
   return monaco.editor.create(element, {
-    model: model as never,
+    model,
     automaticLayout: true,
     colorDecorators: false,
     fixedOverflowWidgets: true,
@@ -297,26 +357,50 @@ function buildEditor(
     lineHeight: 22,
     fontFamily: "IBM Plex Mono, ui-monospace, SFMono-Regular, monospace",
     padding: { top: 18, bottom: 18 },
-    theme: THEME_NAME,
+    theme: activeTheme === "light" ? THEME_LIGHT : THEME_DARK,
     ...options,
   });
 }
 
-function registerYaraEditorActions(
+function registerEditorActions(
   editor: monaco.editor.IStandaloneCodeEditor,
+  handlers: EditorActionHandlers,
 ) {
-  return editor.addAction({
-    id: "yara-x.format-document",
-    label: "Format YARA document",
-    keybindings: [
-      monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
-      monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyF,
-    ],
-    run: async () => {
-      const action = editor.getAction("editor.action.formatDocument");
-      await action?.run();
+  const actions: monaco.IDisposable[] = [];
+  const { onFormatRequest, onRunRequest } = handlers;
+
+  if (onFormatRequest) {
+    actions.push(
+      editor.addAction({
+        id: "yara-x.format-document",
+        label: "Format YARA document",
+        keybindings: [
+          monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
+          monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyF,
+        ],
+        run: onFormatRequest,
+      }),
+    );
+  }
+
+  if (onRunRequest) {
+    actions.push(
+      editor.addAction({
+        id: "yara-x.run-scan",
+        label: "Run YARA rule",
+        keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter],
+        run: onRunRequest,
+      }),
+    );
+  }
+
+  return {
+    dispose: () => {
+      for (const action of actions) {
+        action.dispose();
+      }
     },
-  });
+  };
 }
 
 function toHandle(
@@ -338,36 +422,75 @@ function toHandle(
 
       if (!model) {
         decorations.clear();
+        editor
+          .getDomNode()
+          ?.parentElement?.classList.remove("has-active-match");
         return;
       }
 
-      decorations.set(
-        highlights
-          .filter((highlight) => highlight.end > highlight.start)
-          .map((highlight) => {
-            const start = model.getPositionAt(highlight.start);
-            const end = model.getPositionAt(highlight.end);
+      const nextDecorations: monaco.editor.IModelDeltaDecoration[] = [];
+      let hasActiveMatch = false;
 
-            return {
-              range: {
-                startLineNumber: start.lineNumber,
-                startColumn: start.column,
-                endLineNumber: end.lineNumber,
-                endColumn: end.column,
-              },
-              options: {
-                inlineClassName: "sample-match-highlight",
-                hoverMessage: highlight.hoverMessage
-                  ? {
-                      value: highlight.hoverMessage,
-                    }
-                  : undefined,
-              },
-            };
-          }),
-      );
+      for (const highlight of highlights) {
+        if (highlight.end <= highlight.start) {
+          continue;
+        }
+
+        const start = model.getPositionAt(highlight.start);
+        const end = model.getPositionAt(highlight.end);
+
+        if (highlight.isActive === true) {
+          hasActiveMatch = true;
+        }
+
+        nextDecorations.push({
+          range: {
+            startLineNumber: start.lineNumber,
+            startColumn: start.column,
+            endLineNumber: end.lineNumber,
+            endColumn: end.column,
+          },
+          options: {
+            inlineClassName: highlight.isActive
+              ? "sample-match-highlight is-active"
+              : "sample-match-highlight",
+            hoverMessage: highlight.hoverMessage
+              ? {
+                  value: highlight.hoverMessage,
+                }
+              : undefined,
+          },
+        });
+      }
+
+      editor
+        .getDomNode()
+        ?.parentElement?.classList.toggle("has-active-match", hasActiveMatch);
+      decorations.set(nextDecorations);
     },
-    clearHighlights: () => decorations.clear(),
+    clearHighlights: () => {
+      decorations.clear();
+      editor.getDomNode()?.parentElement?.classList.remove("has-active-match");
+    },
+    revealRange: (start, end) => {
+      const model = editor.getModel();
+
+      if (!model || start < 0 || end <= start) {
+        return false;
+      }
+
+      const startPosition = model.getPositionAt(start);
+      const endPosition = model.getPositionAt(end);
+      const range = new monaco.Range(
+        startPosition.lineNumber,
+        startPosition.column,
+        endPosition.lineNumber,
+        endPosition.column,
+      );
+
+      editor.revealRangeInCenter(range, monaco.editor.ScrollType.Smooth);
+      return true;
+    },
     onDidChangeValue: (listener) =>
       editor.onDidChangeModelContent(() => {
         listener();
@@ -390,6 +513,7 @@ function toHandle(
 export async function createYaraEditor(
   element: HTMLElement,
   initialValue: string,
+  actionHandlers: EditorActionHandlers,
 ): Promise<EditorHandle> {
   await ensureVscodeApi();
   registerYaraLanguage();
@@ -405,14 +529,14 @@ export async function createYaraEditor(
     tabSize: 2,
     insertSpaces: true,
   });
-  const editorAction = registerYaraEditorActions(editor);
+  const editorActions = registerEditorActions(editor, actionHandlers);
   const languageClient = await createYaraLanguageClient();
 
   return toHandle(
     editor,
     modelRef,
     () => {
-      editorAction.dispose();
+      editorActions.dispose();
       languageClient.dispose();
     },
     languageClient.languageServerVersion,
@@ -422,6 +546,7 @@ export async function createYaraEditor(
 export async function createPlainTextEditor(
   element: HTMLElement,
   initialValue: string,
+  actionHandlers: EditorActionHandlers,
 ): Promise<EditorHandle> {
   await ensureVscodeApi();
 
@@ -440,6 +565,7 @@ export async function createPlainTextEditor(
     quickSuggestions: false,
     suggestOnTriggerCharacters: false,
   });
+  const editorActions = registerEditorActions(editor, actionHandlers);
 
-  return toHandle(editor, modelRef);
+  return toHandle(editor, modelRef, () => editorActions.dispose());
 }

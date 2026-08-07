@@ -2,7 +2,6 @@ use indexmap::IndexMap;
 use nom::{
     IResult, Parser,
     bytes::complete::take,
-    combinator::verify,
     error::{Error as NomError, ErrorKind},
     multi::count,
     number::complete::{le_u16, le_u32},
@@ -14,22 +13,41 @@ const OLECF_SIGNATURE: &[u8] =
 const DIRECTORY_ENTRY_SIZE: u64 = 128;
 const MAX_STREAM_SIZE: u64 = 256 * 1024 * 1024;
 
-// Directory Entry Types
-const STORAGE_TYPE: u8 = 1;
-const STREAM_TYPE: u8 = 2;
-const ROOT_STORAGE_TYPE: u8 = 5;
-
 // Special sectors
 const ENDOFCHAIN: u32 = 0xFFFFFFFE;
 const FREESECT: u32 = 0xFFFFFFFF;
 const MAX_REGULAR_SECTOR: u32 = 0xFFFFFFFA;
 
+/// Represents the object type of an MS-CFB Directory Entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirEntryType {
+    Unknown,
+    Storage,
+    Stream,
+    LockBytes,
+    Property,
+    RootStorage,
+}
+
+impl From<u8> for DirEntryType {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Self::Storage,
+            2 => Self::Stream,
+            3 => Self::LockBytes,
+            4 => Self::Property,
+            5 => Self::RootStorage,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// A parser for OLE Compound File Binary Format (MS-CFB) files.
 ///
-/// `OLECFParser` analyzes file headers, FAT/DIFAT allocation chains, directory
+/// `Olecf` analyzes file headers, FAT/DIFAT allocation chains, directory
 /// entries, and stream contents for OLE compound documents (e.g., DOC, XLS,
 /// PPT, MSI).
-pub struct OLECFParser<'a> {
+pub struct Olecf<'a> {
     data: &'a [u8],
     sector_size: usize,
     mini_sector_size: usize,
@@ -46,15 +64,15 @@ pub struct DirectoryEntry {
     pub name: String,
     pub size: u64,
     pub start_sector: u32,
-    pub stream_type: u8,
+    pub stream_type: DirEntryType,
 }
 
-impl<'a> OLECFParser<'a> {
-    /// Creates a new `OLECFParser` from a byte slice and initializes internal
+impl<'a> Olecf<'a> {
+    /// Creates a new `Olecf` from a byte slice and initializes internal
     /// data structures by parsing the file header, FAT/DIFAT tables, and
     /// directory entries.
-    pub fn new(data: &'a [u8]) -> Result<Self, &'static str> {
-        let mut parser = OLECFParser {
+    pub fn parse(data: &'a [u8]) -> Result<Self, &'static str> {
+        let mut olecf = Olecf {
             data,
             sector_size: 0,
             mini_sector_size: 0,
@@ -66,27 +84,26 @@ impl<'a> OLECFParser<'a> {
             dir_entries: IndexMap::new(),
         };
 
-        match parser.parse(data) {
-            Ok((_rest, ())) => Ok(parser),
-            Err(_) => Err("Failed to parse OLECF data"),
-        }
-    }
-
-    /// Parses the top-level OLECF file structure, including the 8-byte signature,
-    /// header fields, and directory chains.
-    fn parse(&mut self, input: &'a [u8]) -> IResult<&'a [u8], ()> {
         // (A) Check the 8-byte OLECF signature.
-        let (input, _) =
-            verify(take(8_usize), |sig: &[u8]| sig == OLECF_SIGNATURE)
-                .parse(input)?;
+        let (input, sig) = take::<_, _, NomError<&[u8]>>(8_usize)
+            .parse(data)
+            .map_err(|_| "Failed to parse OLECF data")?;
+
+        if sig != OLECF_SIGNATURE {
+            return Err("Failed to parse OLECF data");
+        }
 
         // (B) Parse the rest of the header fields.
-        let (input, ()) = self.parse_header(input)?;
+        let (input, ()) = olecf
+            .parse_header(input)
+            .map_err(|_| "Failed to parse OLECF data")?;
 
         // (C) Parse the directory chain.
-        let (input, ()) = self.parse_directory(input)?;
+        olecf
+            .parse_directory(input)
+            .map_err(|_| "Failed to parse OLECF data")?;
 
-        Ok((input, ()))
+        Ok(olecf)
     }
 
     /// Parses the MS-CFB header, including sector shifts, FAT/DIFAT sectors,
@@ -284,19 +301,22 @@ impl<'a> OLECFParser<'a> {
                 if let Ok(entry) =
                     self.read_directory_entry(abs_offset as usize)
                 {
-                    if entry.stream_type == ROOT_STORAGE_TYPE {
+                    if entry.stream_type == DirEntryType::RootStorage {
                         self.mini_stream_start = entry.start_sector;
                         self.mini_stream_size = entry.size;
                     }
-                    if entry.stream_type == STORAGE_TYPE
-                        || entry.stream_type == STREAM_TYPE
-                        || entry.stream_type == ROOT_STORAGE_TYPE
-                    {
+                    if matches!(
+                        entry.stream_type,
+                        DirEntryType::Storage
+                            | DirEntryType::Stream
+                            | DirEntryType::RootStorage
+                    ) {
                         let overwrite = match self.dir_entries.get(&entry.name)
                         {
                             Some(existing) => {
-                                entry.stream_type == STREAM_TYPE
-                                    || existing.stream_type != STREAM_TYPE
+                                entry.stream_type == DirEntryType::Stream
+                                    || existing.stream_type
+                                        != DirEntryType::Stream
                             }
                             None => true,
                         };
@@ -312,6 +332,16 @@ impl<'a> OLECFParser<'a> {
         Ok((_input, ()))
     }
 
+    /// Returns the underlying byte slice.
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Returns the sector size in bytes.
+    pub fn sector_size(&self) -> usize {
+        self.sector_size
+    }
+
     /// Returns `true` if the underlying byte slice starts with a valid 8-byte
     /// OLECF signature (`0xD0CF11E0A1B11AE1`), or `false` otherwise.
     pub fn is_valid_header(&self) -> bool {
@@ -323,7 +353,7 @@ impl<'a> OLECFParser<'a> {
     /// directory.
     ///
     /// Returns an error if the directory contains no streams.
-    pub fn get_stream_names(&self) -> Result<Vec<String>, &'static str> {
+    pub fn stream_names(&self) -> Result<Vec<String>, &'static str> {
         if self.dir_entries.is_empty() {
             return Err("No streams found");
         }
@@ -331,9 +361,7 @@ impl<'a> OLECFParser<'a> {
     }
 
     /// Returns an iterator over all parsed directory entries and their names.
-    pub fn get_streams(
-        &self,
-    ) -> impl Iterator<Item = (&str, &DirectoryEntry)> {
+    pub fn streams(&self) -> impl Iterator<Item = (&str, &DirectoryEntry)> {
         self.dir_entries.iter().map(|(k, v)| (k.as_str(), v))
     }
 
@@ -364,7 +392,8 @@ impl<'a> OLECFParser<'a> {
         let entry =
             self.dir_entries.get(stream_name).ok_or("Stream not found")?;
 
-        if entry.size < 4096 && entry.stream_type != ROOT_STORAGE_TYPE {
+        if entry.size < 4096 && entry.stream_type != DirEntryType::RootStorage
+        {
             self.get_mini_stream_data(entry.start_sector, entry.size)
         } else {
             self.get_regular_stream_data(entry.start_sector, entry.size)
@@ -496,7 +525,7 @@ impl<'a> OLECFParser<'a> {
             name.remove(0);
         }
 
-        let stream_type = self.data[offset + 66];
+        let stream_type = DirEntryType::from(self.data[offset + 66]);
         let start_sector = parse_u32_at(self.data, offset + 116)?;
         let size_32 = parse_u32_at(self.data, offset + 120)?;
         let size = size_32 as u64;
@@ -507,13 +536,12 @@ impl<'a> OLECFParser<'a> {
     /// Core helper that extracts stream data by following a FAT or MiniFAT
     /// chain.
     ///
-    /// Attempts zero-copy slicing from `source_slice` if provided and if the
-    /// sector chain is strictly sequential. Falls back to allocating a vector
-    /// and reading sectors from `fallback_slice`.
+    /// Attempts zero-copy slicing from `stream_data` if it is a borrowed slice
+    /// and if the sector chain is strictly sequential. Falls back to allocating
+    /// a vector and reading sectors from `stream_data`.
     fn get_stream_data_by_chain(
         &self,
-        source_slice: Option<&'a [u8]>,
-        fallback_slice: &[u8],
+        stream_data: &Cow<'a, [u8]>,
         base_offset: u64,
         sector_size: usize,
         start_sector: u32,
@@ -524,21 +552,22 @@ impl<'a> OLECFParser<'a> {
             return Ok(Cow::Borrowed(&[]));
         }
 
-        // Fast path: zero-copy slicing.
-        if let Some(src) = source_slice {
-            if let Ok(slice) = self.try_get_stream_slice(
+        // Fast path: zero-copy slicing if stream_data is borrowed.
+        if let Cow::Borrowed(src) = stream_data
+            && let Ok(slice) = self.try_get_stream_slice(
                 src,
                 base_offset,
                 sector_size,
                 start_sector,
                 size,
                 &next_sector_fn,
-            ) {
-                return Ok(Cow::Borrowed(slice));
-            }
+            )
+        {
+            return Ok(Cow::Borrowed(slice));
         }
 
         // Fallback: Sector-by-sector gathering.
+        let fallback_slice = stream_data.as_ref();
         let mut data = Vec::with_capacity(size);
         let mut current_sector = start_sector;
         let mut visited = Vec::new();
@@ -601,7 +630,7 @@ impl<'a> OLECFParser<'a> {
             return Err("Invalid start sector");
         }
 
-        let needed_sectors = (size + sector_size - 1) / sector_size;
+        let needed_sectors = size.div_ceil(sector_size);
         let mut current_sector = start_sector;
 
         for _ in 1..needed_sectors {
@@ -643,8 +672,7 @@ impl<'a> OLECFParser<'a> {
             return Err("Stream size exceeds maximum allowed size");
         }
         self.get_stream_data_by_chain(
-            Some(self.data),
-            self.data,
+            &Cow::Borrowed(self.data),
             self.sector_size as u64,
             self.sector_size,
             start_sector,
@@ -706,13 +734,8 @@ impl<'a> OLECFParser<'a> {
         }
 
         let mini_stream_data = self.get_root_mini_stream_data()?;
-        let source_slice = match &mini_stream_data {
-            Cow::Borrowed(slice) => Some(*slice),
-            Cow::Owned(_) => None,
-        };
 
         self.get_stream_data_by_chain(
-            source_slice,
             &mini_stream_data,
             0,
             self.mini_sector_size,
