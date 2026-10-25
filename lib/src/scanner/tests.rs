@@ -995,22 +995,147 @@ fn regex_set_optimization() {
                 test_proto2.string_foo matches /foo/ or
                 test_proto2.string_foo matches /bar/
         }
+        rule test_eq_true {
+            condition:
+                test_proto2.string_foo == "bar" or
+                test_proto2.string_foo == "foo"
+        }
+        rule test_eq_commuted_true {
+            condition:
+                "bar" == test_proto2.string_foo or
+                "foo" == test_proto2.string_foo
+        }
+        rule test_eq_false_partial {
+            condition:
+                test_proto2.string_foo == "fo" or
+                test_proto2.string_foo == "oo"
+        }
+        rule test_eq_false_case {
+            condition:
+                test_proto2.string_foo == "FOO" or
+                test_proto2.string_foo == "BAR"
+        }
+        rule test_iequals_true {
+            condition:
+                test_proto2.string_foo iequals "BAR" or
+                "FOO" iequals test_proto2.string_foo
+        }
+        rule test_iequals_false_partial {
+            condition:
+                test_proto2.string_foo iequals "FO" or
+                test_proto2.string_foo iequals "OO"
+        }
+        rule test_contains_true {
+            condition:
+                test_proto2.string_foo contains "ba" or
+                test_proto2.string_foo contains "oo"
+        }
+        rule test_contains_false {
+            condition:
+                test_proto2.string_foo contains "FO" or
+                test_proto2.string_foo contains "BA"
+        }
+        rule test_icontains_true {
+            condition:
+                test_proto2.string_foo icontains "BA" or
+                test_proto2.string_foo icontains "OO"
+        }
+        rule test_startswith_true {
+            condition:
+                test_proto2.string_foo startswith "ba" or
+                test_proto2.string_foo startswith "fo"
+        }
+        rule test_startswith_false {
+            condition:
+                test_proto2.string_foo startswith "oo" or
+                test_proto2.string_foo startswith "FO"
+        }
+        rule test_istartswith_true {
+            condition:
+                test_proto2.string_foo istartswith "BA" or
+                test_proto2.string_foo istartswith "FO"
+        }
+        rule test_istartswith_false {
+            condition:
+                test_proto2.string_foo istartswith "OO" or
+                test_proto2.string_foo istartswith "AR"
+        }
+        rule test_endswith_true {
+            condition:
+                test_proto2.string_foo endswith "ar" or
+                test_proto2.string_foo endswith "oo"
+        }
+        rule test_endswith_false {
+            condition:
+                test_proto2.string_foo endswith "fo" or
+                test_proto2.string_foo endswith "OO"
+        }
+        rule test_iendswith_true {
+            condition:
+                test_proto2.string_foo iendswith "AR" or
+                test_proto2.string_foo iendswith "OO"
+        }
+        rule test_iendswith_false {
+            condition:
+                test_proto2.string_foo iendswith "FO" or
+                test_proto2.string_foo iendswith "BA"
+        }
+        rule test_mixed_true {
+            condition:
+                test_proto2.string_foo == "nope" or
+                test_proto2.string_foo startswith "ba" or
+                test_proto2.string_foo matches /b.r/ or
+                test_proto2.string_foo iendswith "OO"
+        }
+        rule test_special_chars_true {
+            condition:
+                test_proto2.head(10) == "other" or
+                test_proto2.head(10) == "a+b/c\nd\x00\xff*"
+        }
+        rule test_special_chars_multiline_anchor_false {
+            condition:
+                test_proto2.head(10) == "a+b/c" or
+                test_proto2.head(10) == "d\x00\xff*"
+        }
+        rule test_undef_false {
+            condition:
+                test_proto2.string_undef == "foo" or
+                test_proto2.string_undef contains "bar"
+        }
         "#,
     )
     .unwrap();
 
     let mut scanner = crate::Scanner::new(&rules);
-    let results = scanner.scan(b"").unwrap();
+    let results = scanner.scan(b"a+b/c\nd\x00\xff*").unwrap();
 
     let matching_rules: Vec<_> =
         results.matching_rules().map(|r| r.identifier().to_string()).collect();
-    assert_eq!(matching_rules, vec!["test_match"]);
+    assert_eq!(
+        matching_rules,
+        vec![
+            "test_match",
+            "test_eq_true",
+            "test_eq_commuted_true",
+            "test_iequals_true",
+            "test_contains_true",
+            "test_icontains_true",
+            "test_startswith_true",
+            "test_istartswith_true",
+            "test_endswith_true",
+            "test_iendswith_true",
+            "test_mixed_true",
+            "test_special_chars_true",
+        ]
+    );
 }
 
 #[test]
 fn fast_scan_mode() {
     let rules = crate::compile(
         r#"
+    import "math"
+
     rule test_boolean {
       strings:
         $a = "foo"
@@ -1018,61 +1143,125 @@ fn fast_scan_mode() {
       condition:
         $a and $b
     }
-    rule test_count {
+    rule test_count_gt {
       strings:
         $c = "baz"
       condition:
-        #c > 1
+        #c > 2
+    }
+    rule test_count_lt {
+      strings:
+        $d = "qux"
+      condition:
+        not (#d < 3)
+    }
+    rule test_count_eq {
+      strings:
+        $e = "zap"
+      condition:
+        #e != 2
+    }
+    rule test_for_of_count {
+      strings:
+        $f = "wim"
+      condition:
+        for any of ($f) : ( # >= 3 )
+    }
+    rule test_unbounded_offset {
+      strings:
+        $g = "nub"
+      condition:
+        @g[1] >= 0
+    }
+    rule test_shared_pattern_fast_scan {
+      strings:
+        $g = "nub"
+      condition:
+        $g
+    }
+    rule test_anchored_and_all_of_them {
+      strings:
+        $j = "$"
+        $k = "foo"
+      condition:
+        all of them and $j at 0
     }
     "#,
     )
     .unwrap();
 
+    let input = b"$foofoobarbarbazbazbazbazquxquxquxquxzapzapzapzapwimwimwimwimnubnubnubnubzenzenzenzenorborborborb$$$";
+
     // Test standard scan first (fast_scan = false by default)
     let mut scanner = Scanner::new(&rules);
-    let results = scanner.scan(b"foofoobarbarbazbaz").unwrap();
+    let results = scanner.scan(input).unwrap();
 
-    // Check pattern $a matches
-    let test_boolean = results
-        .matching_rules()
-        .find(|r| r.identifier() == "test_boolean")
-        .unwrap();
-    let mut patterns_a =
-        test_boolean.patterns().filter(|p| p.identifier() == "$a");
-    assert_eq!(patterns_a.next().unwrap().matches().len(), 2); // foofoo has 2 matches
+    let get_match_count =
+        |results: &crate::ScanResults, rule_name: &str, pat_name: &str| {
+            results
+                .matching_rules()
+                .find(|r| r.identifier() == rule_name)
+                .unwrap()
+                .patterns()
+                .find(|p| p.identifier() == pat_name)
+                .unwrap()
+                .matches()
+                .len()
+        };
 
-    // Check pattern $c matches
-    let test_count = results
-        .matching_rules()
-        .find(|r| r.identifier() == "test_count")
-        .unwrap();
-    let mut patterns_c =
-        test_count.patterns().filter(|p| p.identifier() == "$c");
-    assert_eq!(patterns_c.next().unwrap().matches().len(), 2); // bazbaz has 2 matches
+    assert_eq!(get_match_count(&results, "test_boolean", "$a"), 2);
+    assert_eq!(get_match_count(&results, "test_count_gt", "$c"), 4);
+    assert_eq!(get_match_count(&results, "test_count_lt", "$d"), 4);
+    assert_eq!(get_match_count(&results, "test_count_eq", "$e"), 4);
+    assert_eq!(get_match_count(&results, "test_for_of_count", "$f"), 4);
+    assert_eq!(get_match_count(&results, "test_unbounded_offset", "$g"), 4);
+    assert_eq!(
+        get_match_count(&results, "test_shared_pattern_fast_scan", "$g"),
+        4
+    );
+    // $j is anchored at 0 even when `all of them` is also present, so only the
+    // match at offset 0 is checked and recorded.
+    assert_eq!(
+        get_match_count(&results, "test_anchored_and_all_of_them", "$j"),
+        1
+    );
+    assert_eq!(
+        get_match_count(&results, "test_anchored_and_all_of_them", "$k"),
+        2
+    );
 
     // Test fast scan mode (fast_scan = true)
     let mut scanner = Scanner::new(&rules);
     scanner.fast_scan(true);
-    let results = scanner.scan(b"foofoobarbarbazbaz").unwrap();
+    let results = scanner.scan(input).unwrap();
 
-    // Rule test_boolean still matches
-    let test_boolean = results
-        .matching_rules()
-        .find(|r| r.identifier() == "test_boolean")
-        .unwrap();
-    // But pattern $a must only have 1 match because it is fast-scanned!
-    let mut patterns_a =
-        test_boolean.patterns().filter(|p| p.identifier() == "$a");
-    assert_eq!(patterns_a.next().unwrap().matches().len(), 1);
-
-    // Pattern $c must still have 2 matches because #c is used, disabling fast scan!
-    let test_count = results
-        .matching_rules()
-        .find(|r| r.identifier() == "test_count")
-        .unwrap();
-    let mut patterns_c =
-        test_count.patterns().filter(|p| p.identifier() == "$c");
-    assert_eq!(patterns_c.next().unwrap().matches().len(), 2);
+    // $a only needs 1 match
+    assert_eq!(get_match_count(&results, "test_boolean", "$a"), 1);
+    // #c > 2 stops after 2 + 1 = 3 matches (even though 4 exist in input)
+    assert_eq!(get_match_count(&results, "test_count_gt", "$c"), 3);
+    // #d < 3 stops after 3 matches (even though 4 exist in input)
+    assert_eq!(get_match_count(&results, "test_count_lt", "$d"), 3);
+    // #e != 2 stops after 2 + 1 = 3 matches (even though 4 exist in input)
+    assert_eq!(get_match_count(&results, "test_count_eq", "$e"), 3);
+    // for any of ($f) : ( # >= 3 ) stops after 3 matches
+    assert_eq!(get_match_count(&results, "test_for_of_count", "$f"), 3);
+    // @g[1] >= 0 disallows fast-scan, so all 4 matches are tracked
+    assert_eq!(get_match_count(&results, "test_unbounded_offset", "$g"), 4);
+    // In test_shared_pattern_fast_scan, $g only needs 1 match even though
+    // test_unbounded_offset declares the same literal without fast-scan.
+    assert_eq!(
+        get_match_count(&results, "test_shared_pattern_fast_scan", "$g"),
+        1
+    );
+    // $j is anchored at 0 and $k stops after 1 match in fast-scan mode
+    assert_eq!(
+        get_match_count(&results, "test_anchored_and_all_of_them", "$j"),
+        1
+    );
+    assert_eq!(
+        get_match_count(&results, "test_anchored_and_all_of_them", "$k"),
+        1
+    );
 }
 
 #[test]
@@ -1122,28 +1311,39 @@ fn test_slow_rule_hang() {
 }
 
 #[test]
+#[cfg(any(
+    all(target_arch = "x86_64", target_feature = "sse2"),
+    all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    )
+))]
 fn test_teddy_scan_timeout() {
+    use std::fmt::Write;
     use std::time::Duration;
 
-    let rules = crate::compile(
-        r#"
-        rule test {
-            strings:
-                $a = "abcd"
-            condition:
-                $a
-        }
-        "#,
-    )
-    .unwrap();
+    // Build a rule with 64 distinct literal patterns (the maximum number of
+    // patterns supported by Teddy) that all share the 4-byte atom `"aaaa"`.
+    // All 64 atoms hash to the same Teddy bucket, so scanning a buffer of `'a'`
+    // bytes triggers 64 Teddy atom matches per byte while failing literal
+    // verification on the trailing `\x00` bytes (which prevents the patterns
+    // from reaching `max_matches_per_pattern` and being disabled).
+    let mut rule = String::from("rule test { strings:\n");
+    for i in 1..=64 {
+        writeln!(rule, r#"$ = "aaaa{}""#, "\\x00".repeat(i)).unwrap();
+    }
+    rule.push_str("condition: any of them }");
+
+    let rules = crate::compile(rule.as_str()).unwrap();
+
+    assert_eq!(rules.atoms.len(), 64);
+    assert!(rules.ac_automaton().teddy.is_some());
 
     let mut scanner = Scanner::new(&rules);
     scanner.set_timeout(Duration::from_secs(1));
 
-    let mut data = Vec::with_capacity(10_000_000);
-    for _ in 0..2_500_000 {
-        data.extend_from_slice(b"abcd");
-    }
+    let data = vec![b'a'; 10_000_000];
 
     let err = scanner.scan(&data).unwrap_err();
     assert_eq!(err.to_string(), "timeout");

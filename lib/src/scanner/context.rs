@@ -17,11 +17,12 @@ use std::{cmp, mem, thread};
 use base64::Engine;
 use bitvec::order::Lsb0;
 use bitvec::slice::BitSlice;
+use bitvec::vec::BitVec;
 use bstr::{BString, ByteSlice};
 use indexmap::IndexMap;
 use protobuf::{MessageDyn, MessageFull};
 use regex_automata::meta::Regex;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::compiler::{
@@ -86,7 +87,7 @@ pub(crate) struct MatchTracker<'r> {
     /// the maximum number of matches or because they are meant to be ignored
     /// during this scan because they belong to some rule that we know that
     /// can't match.
-    pub disabled_patterns: FxHashSet<PatternId>,
+    pub disabled_patterns: BitVec,
     /// The rules that are being used during the scan.
     pub compiled_rules: &'r Rules,
     /// Indicates whether fast mode is enabled. In fast mode the scanner
@@ -569,7 +570,7 @@ impl ScanContext<'_, '_> {
         self.runtime_objects.clear();
 
         // Clear the set that tracks the patterns that has been disabled.
-        self.tracker.disabled_patterns.clear();
+        self.tracker.disabled_patterns.fill(false);
 
         self.tracker.unconfirmed_matches.clear();
         self.num_matching_private_rules = 0;
@@ -657,7 +658,7 @@ impl ScanContext<'_, '_> {
                         thread::sleep(Duration::from_secs(1));
                         wasm::get_engine().increment_epoch();
                         HEARTBEAT_COUNTER
-                            .fetch_update(
+                            .try_update(
                                 Ordering::SeqCst,
                                 Ordering::SeqCst,
                                 |x| Some(x + 1),
@@ -866,7 +867,7 @@ impl ScanContext<'_, '_> {
         atom_idx: usize,
         match_start: usize,
         base: usize,
-        data: &[u8],
+        scanned_data: &[u8],
     ) {
         let atoms = self.compiled_rules.atoms();
         let atom = unsafe { atoms.get_unchecked(atom_idx) };
@@ -886,7 +887,7 @@ impl ScanContext<'_, '_> {
         let (pattern_id, sub_pattern) =
             &self.compiled_rules.get_sub_pattern(sub_pattern_id);
 
-        if self.tracker.disabled_patterns.contains(pattern_id) {
+        if self.tracker.disabled_patterns[usize::from(*pattern_id)] {
             return;
         }
 
@@ -908,7 +909,7 @@ impl ScanContext<'_, '_> {
 
             let match_range = atom_pos..atom_pos + atom.len();
 
-            if verify_full_word(data, &match_range, *flags, None) {
+            if verify_full_word(scanned_data, &match_range, *flags, None) {
                 handle_sub_pattern_match(
                     &mut self.tracker,
                     &mut self.wasm,
@@ -942,11 +943,11 @@ impl ScanContext<'_, '_> {
             | SubPattern::LiteralChainTail { pattern, flags, .. } => {
                 let pattern = self
                     .compiled_rules
-                    .lit_pool()
+                    .literal_pool()
                     .get_bytes(*pattern)
                     .unwrap();
 
-                if verify_literal(pattern, data, atom_pos, *flags) {
+                if verify_literal(pattern, scanned_data, atom_pos, *flags) {
                     handle_sub_pattern_match(
                         &mut self.tracker,
                         &mut self.wasm,
@@ -961,24 +962,33 @@ impl ScanContext<'_, '_> {
             SubPattern::LiteralWithMask { pattern, mask, flags } => {
                 let pattern = self
                     .compiled_rules
-                    .lit_pool()
+                    .literal_pool()
                     .get_bytes(*pattern)
                     .unwrap();
 
-                let mask =
-                    self.compiled_rules.lit_pool().get_bytes(*mask).unwrap();
+                let mask = self
+                    .compiled_rules
+                    .literal_pool()
+                    .get_bytes(*mask)
+                    .unwrap();
 
                 debug_assert_eq!(pattern.len(), mask.len());
 
-                if let Some(data) =
-                    data.get(atom_pos..atom_pos + pattern.len())
-                    && verify_literal_with_mask(data, pattern, mask)
-                {
-                    let match_range = atom_pos..atom_pos + pattern.len();
-                    if !flags.intersects(
-                        SubPatternFlags::FullwordLeft
-                            | SubPatternFlags::FullwordRight,
-                    ) || verify_full_word(data, &match_range, *flags, None)
+                let match_range = atom_pos..atom_pos + pattern.len();
+
+                match scanned_data.get(match_range.start..match_range.end) {
+                    Some(match_data)
+                        if verify_literal_with_mask(
+                            match_data, pattern, mask,
+                        ) && (!flags.intersects(
+                            SubPatternFlags::FullwordLeft
+                                | SubPatternFlags::FullwordRight,
+                        ) || verify_full_word(
+                            scanned_data,
+                            &match_range,
+                            *flags,
+                            None,
+                        )) =>
                     {
                         handle_sub_pattern_match(
                             &mut self.tracker,
@@ -989,13 +999,14 @@ impl ScanContext<'_, '_> {
                             Match::new(match_range).rebase(base),
                         );
                     }
-                }
+                    _ => {}
+                };
             }
             SubPattern::Regexp { flags, .. }
             | SubPattern::RegexpChainHead { flags, .. }
             | SubPattern::RegexpChainTail { flags, .. } => verify_regexp(
                 &mut self.vm,
-                data,
+                scanned_data,
                 atom_pos,
                 atom,
                 *flags,
@@ -1014,12 +1025,12 @@ impl ScanContext<'_, '_> {
             SubPattern::Xor { pattern, flags } => {
                 let pattern = self
                     .compiled_rules
-                    .lit_pool()
+                    .literal_pool()
                     .get_bytes(*pattern)
                     .unwrap();
 
                 if let Some(key) =
-                    verify_xor(pattern, data, atom_pos, atom, *flags)
+                    verify_xor(pattern, scanned_data, atom_pos, atom, *flags)
                 {
                     handle_sub_pattern_match(
                         &mut self.tracker,
@@ -1038,10 +1049,10 @@ impl ScanContext<'_, '_> {
             | SubPattern::Base64Wide { pattern, padding } => {
                 if let Some(match_range) = verify_base64(
                     self.compiled_rules
-                        .lit_pool()
+                        .literal_pool()
                         .get_bytes(*pattern)
                         .unwrap(),
-                    data,
+                    scanned_data,
                     (*padding).into(),
                     atom_pos,
                     &base64::engine::general_purpose::STANDARD_NO_PAD,
@@ -1067,7 +1078,7 @@ impl ScanContext<'_, '_> {
                     alphabet_id,
                     || {
                         let alphabet = compiled_rules
-                            .lit_pool()
+                            .literal_pool()
                             .get_str(*alphabet)
                             .unwrap();
                         let alphabet =
@@ -1081,10 +1092,10 @@ impl ScanContext<'_, '_> {
 
                 if let Some(match_range) = verify_base64(
                     self.compiled_rules
-                        .lit_pool()
+                        .literal_pool()
                         .get_bytes(*pattern)
                         .unwrap(),
-                    data,
+                    scanned_data,
                     (*padding).into(),
                     atom_pos,
                     base64_engine,
@@ -1149,7 +1160,9 @@ impl ScanContext<'_, '_> {
             let filesize = self.get_filesize();
             for (pattern_id, bounds) in self.compiled_rules.filesize_bounds() {
                 if !bounds.contains(filesize) {
-                    self.tracker.disabled_patterns.insert(*pattern_id);
+                    self.tracker
+                        .disabled_patterns
+                        .set(usize::from(*pattern_id), true);
                 }
             }
         }
@@ -1159,7 +1172,9 @@ impl ScanContext<'_, '_> {
                 self.compiled_rules.header_constraints()
             {
                 if !constraints.is_satisfied(data) {
-                    self.tracker.disabled_patterns.insert(*pattern_id);
+                    self.tracker
+                        .disabled_patterns
+                        .set(usize::from(*pattern_id), true);
                 }
             }
         }
@@ -1216,7 +1231,7 @@ impl ScanContext<'_, '_> {
             .iter()
             .map(|id| (id, self.compiled_rules.get_sub_pattern(*id)))
         {
-            if self.tracker.disabled_patterns.contains(pattern_id) {
+            if self.tracker.disabled_patterns[usize::from(*pattern_id)] {
                 continue;
             }
             match sub_pattern {
@@ -1232,7 +1247,7 @@ impl ScanContext<'_, '_> {
                     if let (offset, false) = offset.overflowing_sub(base) {
                         let pattern = self
                             .compiled_rules
-                            .lit_pool()
+                            .literal_pool()
                             .get_bytes(*pattern)
                             .unwrap();
 
@@ -1966,47 +1981,56 @@ fn track_match(
 
     bits.set(pattern_id.into(), true);
 
-    // If we are in fast scan mode, and this pattern is suitable to be disabled
-    // in fast scan mode, disabled it because we already found the first match.
-    let mut disable_pattern =
-        tracker.fast_scan && tracker.compiled_rules.is_fast_scan(pattern_id);
+    let mut disable_pattern = false;
 
     match tracker.pattern_matches.add(pattern_id, match_, replace_if_longer) {
-        #[cfg(feature = "logging")]
-        AddResult::Inserted(len) if len % 100_000 == 0 => {
-            let (rule, pattern) = tracker
-                .compiled_rules
-                .get_rule_and_pattern_by_pattern_id(pattern_id)
-                .unwrap();
+        AddResult::Inserted(current_matches) => {
+            #[cfg(feature = "logging")]
+            if current_matches % 100_000 == 0 {
+                let (rule, pattern) = tracker
+                    .compiled_rules
+                    .get_rule_and_pattern_by_pattern_id(pattern_id)
+                    .unwrap();
 
-            log::warn!(
-                "Pattern `{}` in rule `{}:{}` grew to {} matches",
-                tracker
-                    .compiled_rules
-                    .ident_pool()
-                    .get(pattern.ident_id)
-                    .unwrap(),
-                tracker
-                    .compiled_rules
-                    .ident_pool()
-                    .get(rule.namespace_ident_id)
-                    .unwrap(),
-                tracker
-                    .compiled_rules
-                    .ident_pool()
-                    .get(rule.ident_id)
-                    .unwrap(),
-                len
-            );
+                log::warn!(
+                    "Pattern `{}` in rule `{}:{}` grew to {} matches",
+                    tracker
+                        .compiled_rules
+                        .ident_pool()
+                        .get(pattern.ident_id)
+                        .unwrap(),
+                    tracker
+                        .compiled_rules
+                        .ident_pool()
+                        .get(rule.namespace_ident_id)
+                        .unwrap(),
+                    tracker
+                        .compiled_rules
+                        .ident_pool()
+                        .get(rule.ident_id)
+                        .unwrap(),
+                    current_matches
+                );
+            }
+            // If we are in fast-scan mode, and the current number of matches
+            // for the pattern already equals or exceeds maximum matches, then
+            // the pattern can be disabled.
+            if tracker.fast_scan
+                && let Some(max_matches) =
+                    tracker.compiled_rules.fast_scan_max_matches(pattern_id)
+                && current_matches >= max_matches.get() as usize
+            {
+                disable_pattern = true;
+            }
         }
         AddResult::MaxMatchesReached => {
             disable_pattern = true;
         }
-        _ => {}
+        AddResult::Updated => {}
     }
 
     if disable_pattern {
-        tracker.disabled_patterns.insert(pattern_id);
+        tracker.disabled_patterns.set(usize::from(pattern_id), true);
     }
 }
 
@@ -2169,7 +2193,7 @@ pub fn create_wasm_store_and_ctx<'r>(
         tracker: MatchTracker {
             pattern_matches: PatternMatches::new(),
             unconfirmed_matches: FxHashMap::default(),
-            disabled_patterns: FxHashSet::default(),
+            disabled_patterns: BitVec::repeat(false, num_patterns as usize),
             compiled_rules: rules,
             fast_scan: false,
         },
