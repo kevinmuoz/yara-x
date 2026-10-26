@@ -2,12 +2,12 @@
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
 export const runWorkerServer: () => [number, number];
-export const wasm_bindgen__convert__closures_____invoke__h3a5a07f45bf14f3b: (
+export const wasm_bindgen_120971e1b3824f36___convert__closures_____invoke___wasm_bindgen_120971e1b3824f36___JsValue__core_37ee0ce0c4cd57d5___result__Result_____wasm_bindgen_120971e1b3824f36___JsError___true_: (
   a: number,
   b: number,
   c: any,
 ) => [number, number];
-export const wasm_bindgen__convert__closures_____invoke__h09ac2f2146a400db: (
+export const wasm_bindgen_120971e1b3824f36___convert__closures_____invoke___web_sys_b29ec0f7b3a8ab33___features__gen_MessageEvent__MessageEvent______true_: (
   a: number,
   b: number,
   c: any,
